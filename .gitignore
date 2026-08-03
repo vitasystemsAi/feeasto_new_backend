@@ -1,0 +1,75 @@
+# dependencies
+node_modules/
+/.pnp
+.pnp.js
+package-lock.json.bak
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+next-env.d.ts
+
+# production
+/build
+/dist
+
+# cache
+.cache/
+.eslintcache
+.stylelintcache
+.turbo/
+.swc/
+.parcel-cache/
+*.tsbuildinfo
+.npm/
+.yarn/cache/
+.pnpm-store/
+
+# misc
+.DS_Store
+*.pem
+Thumbs.db
+
+# debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# env files - NEVER commit these (DB credentials live here)
+.env
+.env*.local
+.env.development
+.env.test
+.env.production
+
+# vercel
+.vercel
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# database
+*.sql.bak
+*.sqlite
+*.sqlite3
+mysql-data/
+db_backup/
+
+# logs
+logs/
+*.log
+
+# uploads / temp
+tmp/
+temp/
+uploads/

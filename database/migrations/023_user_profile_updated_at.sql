@@ -1,0 +1,4 @@
+-- Profile edit limit: one update per calendar day (see users.profile_updated_at)
+-- Applied at runtime by ensureUserProfileSchema(); run manually if needed:
+-- ALTER TABLE users ADD COLUMN phone VARCHAR(20) NULL AFTER email;
+-- ALTER TABLE users ADD COLUMN profile_updated_at DATETIME NULL;

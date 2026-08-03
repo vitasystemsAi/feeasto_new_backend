@@ -1,0 +1,2 @@
+ALTER TABLE orders
+  ADD COLUMN cancelled_by VARCHAR(20) NULL DEFAULT NULL AFTER accepted_at;

@@ -1,0 +1,55 @@
+openapi: 3.0.3
+info:
+  title: Restaurant SaaS API
+  version: 1.0.0
+servers:
+  - url: http://localhost:5000/api/v1
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+  /auth/register:
+    post:
+      summary: Register user with role
+      responses:
+        "201":
+          description: User registered
+  /auth/login:
+    post:
+      summary: Login and issue JWT tokens
+      responses:
+        "200":
+          description: Auth success
+  /restaurants/onboard:
+    post:
+      summary: Onboard new restaurant (owner)
+      responses:
+        "201":
+          description: Restaurant submitted for approval
+  /orders:
+    post:
+      summary: Place a new order
+      responses:
+        "201":
+          description: Order placed
+  /orders/{orderId}/status:
+    patch:
+      summary: Update order status and broadcast realtime event
+      parameters:
+        - in: path
+          name: orderId
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Status updated
+  /analytics/owner-kpis:
+    get:
+      summary: Owner analytics dashboard
+      responses:
+        "200":
+          description: KPI payload

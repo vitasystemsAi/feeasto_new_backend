@@ -1,0 +1,8 @@
+{
+  "watch": ["src"],
+  "ext": "js,json,yaml,yml",
+  "ignore": ["uploads/**", "database/**", "docs/**", "node_modules/**", "*.log"],
+  "legacyWatch": true,
+  "delay": 300
+}
+

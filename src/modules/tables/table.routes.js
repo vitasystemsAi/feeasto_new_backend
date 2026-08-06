@@ -4,6 +4,8 @@ const pool = require("../../db/pool");
 const auth = require("../../middlewares/auth");
 const rbac = require("../../middlewares/rbac");
 const tenantScope = require("../../middlewares/tenant");
+const env = require("../../config/env");
+const { ensureTableHasQrToken, generateQrToken } = require("./ensureTableQrSchema");
 
 function normalizeStatus(status) {
   const upper = String(status || "").toUpperCase();
@@ -36,18 +38,45 @@ function tableRoutes(io) {
     let rows;
     try {
       [rows] = await pool.execute(
-        "SELECT id, table_number, capacity, status, reserved_from, reserved_to FROM restaurant_tables WHERE tenant_id = ? AND restaurant_id = ? ORDER BY table_number ASC",
+        "SELECT id, table_number, capacity, status, qr_token, reserved_from, reserved_to FROM restaurant_tables WHERE tenant_id = ? AND restaurant_id = ? ORDER BY table_number ASC",
         [req.tenantId, parsed.data.restaurantId]
       );
     } catch (error) {
       if (error?.code !== "ER_BAD_FIELD_ERROR") throw error;
-      [rows] = await pool.execute(
-        "SELECT id, table_number, capacity, status FROM restaurant_tables WHERE tenant_id = ? AND restaurant_id = ? ORDER BY table_number ASC",
-        [req.tenantId, parsed.data.restaurantId]
-      );
-      rows = rows.map((r) => ({ ...r, reserved_from: null, reserved_to: null }));
+      try {
+        [rows] = await pool.execute(
+          "SELECT id, table_number, capacity, status, reserved_from, reserved_to FROM restaurant_tables WHERE tenant_id = ? AND restaurant_id = ? ORDER BY table_number ASC",
+          [req.tenantId, parsed.data.restaurantId]
+        );
+        rows = rows.map((r) => ({ ...r, qr_token: null }));
+      } catch (error2) {
+        if (error2?.code !== "ER_BAD_FIELD_ERROR") throw error2;
+        [rows] = await pool.execute(
+          "SELECT id, table_number, capacity, status FROM restaurant_tables WHERE tenant_id = ? AND restaurant_id = ? ORDER BY table_number ASC",
+          [req.tenantId, parsed.data.restaurantId]
+        );
+        rows = rows.map((r) => ({ ...r, reserved_from: null, reserved_to: null, qr_token: null }));
+      }
     }
-    return res.json({ items: rows });
+
+    const frontendBase = String(env.frontendUrl || "").replace(/\/$/, "");
+    const items = [];
+    for (const row of rows) {
+      let qrToken = row.qr_token;
+      if (!qrToken) {
+        try {
+          qrToken = await ensureTableHasQrToken(row.id);
+        } catch {
+          qrToken = null;
+        }
+      }
+      items.push({
+        ...row,
+        qr_token: qrToken,
+        qr_url: qrToken ? `${frontendBase}/t/${qrToken}` : null,
+      });
+    }
+    return res.json({ items });
   });
 
   router.post("/", auth(), rbac("OWNER", "MANAGER"), tenantScope, async (req, res) => {
@@ -59,12 +88,90 @@ function tableRoutes(io) {
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ errors: parsed.error.issues });
 
-    const [result] = await pool.execute(
-      "INSERT INTO restaurant_tables (tenant_id, restaurant_id, table_number, capacity, status) VALUES (?, ?, ?, ?, 'AVAILABLE')",
-      [req.tenantId, parsed.data.restaurantId, parsed.data.tableNumber, parsed.data.capacity]
-    );
+    const qrToken = generateQrToken();
+    let result;
+    try {
+      [result] = await pool.execute(
+        "INSERT INTO restaurant_tables (tenant_id, restaurant_id, table_number, capacity, status, qr_token) VALUES (?, ?, ?, ?, 'AVAILABLE', ?)",
+        [req.tenantId, parsed.data.restaurantId, parsed.data.tableNumber, parsed.data.capacity, qrToken]
+      );
+    } catch (error) {
+      if (error?.code !== "ER_BAD_FIELD_ERROR") throw error;
+      [result] = await pool.execute(
+        "INSERT INTO restaurant_tables (tenant_id, restaurant_id, table_number, capacity, status) VALUES (?, ?, ?, ?, 'AVAILABLE')",
+        [req.tenantId, parsed.data.restaurantId, parsed.data.tableNumber, parsed.data.capacity]
+      );
+    }
     io.to(`tenant:${req.tenantId}`).emit("table:updated", { tableId: result.insertId, action: "CREATED" });
-    return res.status(201).json({ id: result.insertId });
+    const frontendBase = String(env.frontendUrl || "").replace(/\/$/, "");
+    return res.status(201).json({
+      id: result.insertId,
+      qr_token: qrToken,
+      qr_url: `${frontendBase}/t/${qrToken}`,
+    });
+  });
+
+  router.get("/:tableId/qr", auth(), rbac("OWNER", "MANAGER"), tenantScope, async (req, res) => {
+    const tableId = Number(req.params.tableId);
+    if (!tableId) return res.status(400).json({ message: "Invalid table id" });
+
+    const [[row]] = await pool.execute(
+      "SELECT id, table_number, restaurant_id, qr_token FROM restaurant_tables WHERE id = ? AND tenant_id = ? LIMIT 1",
+      [tableId, req.tenantId]
+    );
+    if (!row) return res.status(404).json({ message: "Table not found" });
+
+    let qrToken = row.qr_token;
+    if (!qrToken) {
+      qrToken = await ensureTableHasQrToken(tableId);
+    }
+    if (!qrToken) return res.status(500).json({ message: "Could not allocate QR token" });
+
+    const frontendBase = String(env.frontendUrl || "").replace(/\/$/, "");
+    return res.json({
+      tableId: row.id,
+      tableNumber: row.table_number,
+      restaurantId: row.restaurant_id,
+      qrToken,
+      qrUrl: `${frontendBase}/t/${qrToken}`,
+    });
+  });
+
+  router.post("/:tableId/qr/regenerate", auth(), rbac("OWNER", "MANAGER"), tenantScope, async (req, res) => {
+    const tableId = Number(req.params.tableId);
+    if (!tableId) return res.status(400).json({ message: "Invalid table id" });
+
+    const [[row]] = await pool.execute(
+      "SELECT id, table_number FROM restaurant_tables WHERE id = ? AND tenant_id = ? LIMIT 1",
+      [tableId, req.tenantId]
+    );
+    if (!row) return res.status(404).json({ message: "Table not found" });
+
+    let qrToken = null;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const next = generateQrToken();
+      try {
+        await pool.execute("UPDATE restaurant_tables SET qr_token = ? WHERE id = ? AND tenant_id = ?", [
+          next,
+          tableId,
+          req.tenantId,
+        ]);
+        qrToken = next;
+        break;
+      } catch (error) {
+        if (error?.code !== "ER_DUP_ENTRY") throw error;
+      }
+    }
+    if (!qrToken) return res.status(500).json({ message: "Could not regenerate QR token" });
+
+    const frontendBase = String(env.frontendUrl || "").replace(/\/$/, "");
+    io.to(`tenant:${req.tenantId}`).emit("table:updated", { tableId, action: "QR_REGENERATED" });
+    return res.json({
+      tableId,
+      tableNumber: row.table_number,
+      qrToken,
+      qrUrl: `${frontendBase}/t/${qrToken}`,
+    });
   });
 
   router.patch("/:tableId", auth(), rbac("OWNER", "MANAGER"), tenantScope, async (req, res) => {

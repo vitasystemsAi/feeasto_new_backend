@@ -116,6 +116,72 @@ function respondCustomerRadiusBlocked(res, check) {
 let hasAcceptedAtColumnCache = null;
 let hasCancelledByColumnCache = null;
 let hasCancellationReasonColumnCache = null;
+let hasTokenNumberColumnCache = null;
+let hasDailyTokensTableCache = null;
+
+/** Calendar date in Asia/Kolkata — token series resets at 12:00 AM IST. */
+function tokenDateIst() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+}
+
+async function ensureTokenNumberColumn() {
+  if (hasTokenNumberColumnCache === true) return true;
+  const [rows] = await pool.execute(
+    `SELECT 1 FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'orders' AND COLUMN_NAME = 'token_number' LIMIT 1`
+  );
+  if (rows.length > 0) {
+    hasTokenNumberColumnCache = true;
+    return true;
+  }
+  try {
+    await pool.execute("ALTER TABLE orders ADD COLUMN token_number INT NULL DEFAULT NULL AFTER order_type");
+    hasTokenNumberColumnCache = true;
+    return true;
+  } catch (error) {
+    if (error?.code === "ER_DUP_FIELDNAME") {
+      hasTokenNumberColumnCache = true;
+      return true;
+    }
+    return false;
+  }
+}
+
+async function ensureDailyTokensTable() {
+  if (hasDailyTokensTableCache === true) return true;
+  try {
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS restaurant_daily_tokens (
+        restaurant_id BIGINT NOT NULL,
+        token_date DATE NOT NULL,
+        next_token INT NOT NULL DEFAULT 1,
+        PRIMARY KEY (restaurant_id, token_date)
+      )
+    `);
+    hasDailyTokensTableCache = true;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Next token for this restaurant today (starts at 1; new day → 1 again).
+ * Must run inside an open transaction (conn).
+ */
+async function allocateDailyToken(conn, restaurantId) {
+  await ensureTokenNumberColumn();
+  await ensureDailyTokensTable();
+  const tokenDate = tokenDateIst();
+  await conn.execute(
+    `INSERT INTO restaurant_daily_tokens (restaurant_id, token_date, next_token)
+     VALUES (?, ?, LAST_INSERT_ID(1))
+     ON DUPLICATE KEY UPDATE next_token = LAST_INSERT_ID(next_token + 1)`,
+    [restaurantId, tokenDate]
+  );
+  const [[row]] = await conn.execute("SELECT LAST_INSERT_ID() AS token");
+  return Number(row?.token) || 1;
+}
 
 async function ensureCancelledByColumn() {
   if (hasCancelledByColumnCache === true) return true;
@@ -396,25 +462,42 @@ function orderRouter(io) {
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ errors: parsed.error.issues });
 
+    const conn = await pool.getConnection();
     try {
-      const [created] = await pool.execute(
-        "INSERT INTO orders (tenant_id, restaurant_id, customer_user_id, table_id, order_type, status) VALUES (?, ?, ?, NULL, 'TAKEAWAY', 'PLACED')",
-        [req.tenantId, parsed.data.restaurantId, req.user.sub]
-      );
-      const orderId = created.insertId;
-      io.to(`tenant:${req.tenantId}`).emit("order:created", { orderId, status: "PLACED", orderType: "TAKEAWAY" });
-      return res.status(201).json({ orderId, created: true });
-    } catch (error) {
-      if (error?.code === "ER_BAD_FIELD_ERROR") {
-        const [created] = await pool.execute(
-          "INSERT INTO orders (tenant_id, restaurant_id, customer_user_id, order_type, status) VALUES (?, ?, ?, 'TAKEAWAY', 'PLACED')",
-          [req.tenantId, parsed.data.restaurantId, req.user.sub]
+      await conn.beginTransaction();
+      await ensureTokenNumberColumn();
+      const tokenNumber = await allocateDailyToken(conn, parsed.data.restaurantId);
+      let orderId;
+      try {
+        const [created] = await conn.execute(
+          "INSERT INTO orders (tenant_id, restaurant_id, customer_user_id, table_id, order_type, token_number, status) VALUES (?, ?, ?, NULL, 'TAKEAWAY', ?, 'PLACED')",
+          [req.tenantId, parsed.data.restaurantId, req.user.sub, tokenNumber]
         );
-        const orderId = created.insertId;
-        io.to(`tenant:${req.tenantId}`).emit("order:created", { orderId, status: "PLACED", orderType: "TAKEAWAY" });
-        return res.status(201).json({ orderId, created: true });
+        orderId = created.insertId;
+      } catch (error) {
+        if (error?.code === "ER_BAD_FIELD_ERROR") {
+          const [created] = await conn.execute(
+            "INSERT INTO orders (tenant_id, restaurant_id, customer_user_id, order_type, status) VALUES (?, ?, ?, 'TAKEAWAY', 'PLACED')",
+            [req.tenantId, parsed.data.restaurantId, req.user.sub]
+          );
+          orderId = created.insertId;
+        } else {
+          throw error;
+        }
       }
+      await conn.commit();
+      io.to(`tenant:${req.tenantId}`).emit("order:created", {
+        orderId,
+        status: "PLACED",
+        orderType: "TAKEAWAY",
+        tokenNumber,
+      });
+      return res.status(201).json({ orderId, tokenNumber, created: true });
+    } catch (error) {
+      await conn.rollback();
       return res.status(500).json({ message: "Failed to start takeaway order", details: error.message });
+    } finally {
+      conn.release();
     }
   });
 
@@ -431,12 +514,15 @@ function orderRouter(io) {
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
+      await ensureTokenNumberColumn();
+
+      const tokenNumber = await allocateDailyToken(conn, parsed.data.restaurantId);
 
       let orderId;
       try {
         const [created] = await conn.execute(
-          "INSERT INTO orders (tenant_id, restaurant_id, customer_user_id, table_id, order_type, status) VALUES (?, ?, ?, NULL, 'TAKEAWAY', 'PLACED')",
-          [req.tenantId, parsed.data.restaurantId, req.user.sub]
+          "INSERT INTO orders (tenant_id, restaurant_id, customer_user_id, table_id, order_type, token_number, status) VALUES (?, ?, ?, NULL, 'TAKEAWAY', ?, 'PLACED')",
+          [req.tenantId, parsed.data.restaurantId, req.user.sub, tokenNumber]
         );
         orderId = created.insertId;
       } catch (error) {
@@ -459,9 +545,14 @@ function orderRouter(io) {
       }
 
       await conn.commit();
-      io.to(`tenant:${req.tenantId}`).emit("order:created", { orderId, status: "PLACED", orderType: "TAKEAWAY" });
+      io.to(`tenant:${req.tenantId}`).emit("order:created", {
+        orderId,
+        status: "PLACED",
+        orderType: "TAKEAWAY",
+        tokenNumber,
+      });
       // Do not also emit order:items-added — that double-fires prep prints / looks like a bill run.
-      return res.status(201).json({ orderId, created: true });
+      return res.status(201).json({ orderId, tokenNumber, created: true });
     } catch (error) {
       await conn.rollback();
       return res.status(500).json({ message: "Failed to place takeaway order", details: error.message });
@@ -492,6 +583,7 @@ function orderRouter(io) {
 
     return rows.map((row) => ({
       id: row.id,
+      token_number: row.token_number != null ? Number(row.token_number) : null,
       status: row.status,
       created_at: row.created_at,
       item_count: counts[row.id] || 0,
@@ -507,9 +599,10 @@ function orderRouter(io) {
   router.get("/takeaway/open", auth(), tenantScope, async (req, res) => {
     const restaurantId = Number(req.query.restaurantId || 0);
     if (!restaurantId) return res.status(400).json({ message: "restaurantId is required" });
+    await ensureTokenNumberColumn();
 
     const [openRows] = await pool.execute(
-      `SELECT o.id, o.status, o.created_at, NULL AS invoice_number,
+      `SELECT o.id, o.token_number, o.status, o.created_at, NULL AS invoice_number,
               u.full_name AS customer_name,
               (SELECT p.payment_status FROM payments p WHERE p.order_id = o.id ORDER BY p.id DESC LIMIT 1) AS payment_status
        FROM orders o
@@ -524,9 +617,12 @@ function orderRouter(io) {
     );
 
     const [recentRows] = await pool.execute(
-      `SELECT o.id, o.status, o.created_at,
-              (SELECT i.invoice_number FROM invoices i WHERE i.order_id = o.id AND i.tenant_id = o.tenant_id ORDER BY i.id DESC LIMIT 1) AS invoice_number
+      `SELECT o.id, o.token_number, o.status, o.created_at,
+              (SELECT i.invoice_number FROM invoices i WHERE i.order_id = o.id AND i.tenant_id = o.tenant_id ORDER BY i.id DESC LIMIT 1) AS invoice_number,
+              u.full_name AS customer_name,
+              (SELECT p.payment_status FROM payments p WHERE p.order_id = o.id ORDER BY p.id DESC LIMIT 1) AS payment_status
        FROM orders o
+       LEFT JOIN users u ON u.id = o.customer_user_id
        WHERE o.tenant_id = ?
          AND o.restaurant_id = ?
          AND o.order_type = 'TAKEAWAY'
@@ -553,7 +649,7 @@ function orderRouter(io) {
       : "AND status IN ('PLACED','ACCEPTED','PREPARING','READY')";
 
     const [[order]] = await pool.execute(
-      `SELECT id, status, created_at
+      `SELECT id, status, created_at, token_number
        FROM orders
        WHERE id = ?
          AND tenant_id = ?
@@ -574,7 +670,44 @@ function orderRouter(io) {
       [order.id]
     );
     const subtotal = items.reduce((sum, it) => sum + Number(it.line_total || 0), 0);
-    return res.json({ hasActiveOrder: true, order: { ...order, items, subtotal } });
+
+    let billing = null;
+    if (allowCompleted) {
+      const [paymentRows] = await pool.execute(
+        `SELECT payment_method, payment_provider, amount, payment_status
+         FROM payments
+         WHERE order_id = ? AND tenant_id = ? AND payment_status IN ('PAID', 'PARTIALLY_REFUNDED')
+         ORDER BY id ASC`,
+        [order.id, req.tenantId]
+      );
+      const [[invoice]] = await pool.execute(
+        `SELECT invoice_number FROM invoices WHERE order_id = ? AND tenant_id = ? ORDER BY id DESC LIMIT 1`,
+        [order.id, req.tenantId]
+      );
+      if (paymentRows.length > 0) {
+        const payments = paymentRows.map((row) => {
+          const provider = String(row.payment_provider || "").toUpperCase();
+          let method = provider;
+          if (row.payment_method === "COD" || provider === "CASH") method = "CASH";
+          else if (provider === "CARD") method = "CARD";
+          else if (provider === "UPI") method = "UPI";
+          return { method, amount: Number(row.amount || 0) };
+        });
+        const grandTotal = payments.reduce((sum, p) => sum + p.amount, 0);
+        const taxAmount = Math.max(0, grandTotal - subtotal);
+        const taxPercent = subtotal > 0 ? Math.round((taxAmount / subtotal) * 10000) / 100 : 0;
+        billing = {
+          invoiceNumber: invoice?.invoice_number || null,
+          paymentMode: payments.length > 1 ? "SPLIT" : "SINGLE",
+          payments,
+          grandTotal,
+          taxAmount,
+          taxPercent,
+        };
+      }
+    }
+
+    return res.json({ hasActiveOrder: true, order: { ...order, items, subtotal }, billing });
   });
 
   router.post("/takeaway/:orderId/checkout", auth(), tenantScope, async (req, res) => {
@@ -798,18 +931,37 @@ function orderRouter(io) {
     let openRows;
     let servedRows;
     try {
-      [openRows] = await pool.execute(
-        `SELECT o.id, o.status, o.created_at, o.accepted_at, o.table_id, o.order_type,
-                rt.table_number, rt.capacity
-         FROM orders o
-         LEFT JOIN restaurant_tables rt ON rt.id = o.table_id
-         WHERE o.tenant_id = ?
-           AND o.restaurant_id = ?
-           ${orderTypeFilter}
-           AND o.status IN ('PLACED','ACCEPTED','PREPARING','READY')
-         ORDER BY o.created_at ASC`,
-        [tenantId, restaurantId]
-      );
+      try {
+        [openRows] = await pool.execute(
+          `SELECT o.id, o.status, o.created_at, o.accepted_at, o.table_id, o.order_type,
+                  o.guest_name, o.customer_contact_phone,
+                  rt.table_number, rt.capacity,
+                  u.full_name AS customer_user_name
+           FROM orders o
+           LEFT JOIN restaurant_tables rt ON rt.id = o.table_id
+           LEFT JOIN users u ON u.id = o.customer_user_id
+           WHERE o.tenant_id = ?
+             AND o.restaurant_id = ?
+             ${orderTypeFilter}
+             AND o.status IN ('PLACED','ACCEPTED','PREPARING','READY')
+           ORDER BY o.created_at ASC`,
+          [tenantId, restaurantId]
+        );
+      } catch (error) {
+        if (error?.code !== "ER_BAD_FIELD_ERROR") throw error;
+        [openRows] = await pool.execute(
+          `SELECT o.id, o.status, o.created_at, o.accepted_at, o.table_id, o.order_type,
+                  rt.table_number, rt.capacity
+           FROM orders o
+           LEFT JOIN restaurant_tables rt ON rt.id = o.table_id
+           WHERE o.tenant_id = ?
+             AND o.restaurant_id = ?
+             ${orderTypeFilter}
+             AND o.status IN ('PLACED','ACCEPTED','PREPARING','READY')
+           ORDER BY o.created_at ASC`,
+          [tenantId, restaurantId]
+        );
+      }
       [servedRows] = await pool.execute(
         `SELECT o.id, o.status, o.created_at, o.table_id, o.order_type, rt.table_number
          FROM orders o
@@ -833,6 +985,8 @@ function orderRouter(io) {
 
     const mapRow = (row) => {
       const orderType = String(row.order_type || "DINE_IN").toUpperCase();
+      const guestName = row.guest_name || null;
+      const guestPhone = row.customer_contact_phone || null;
       const enriched = enrichOrderRow(
         { ...row, order_type: orderType, customer_user_id: null },
         itemsByOrder
@@ -843,6 +997,10 @@ function orderRouter(io) {
         table_id: row.table_id,
         table_number: row.table_number,
         table_capacity: row.capacity,
+        guest_name: guestName,
+        customer_name: guestName || row.customer_user_name || null,
+        customer_phone: guestPhone,
+        order_source: guestName ? "QR_TABLE" : null,
       };
     };
 
@@ -1613,6 +1771,7 @@ function orderRouter(io) {
   router.get("/restaurant", auth(), rbac("OWNER", "MANAGER", "ADMIN"), async (req, res) => {
     await ensureAcceptedAtColumn();
     await ensureCancelledByColumn();
+    await ensureTokenNumberColumn();
     const schema = z.object({
       restaurantId: z.coerce.number().int().positive(),
       date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
@@ -1640,7 +1799,7 @@ function orderRouter(io) {
 
     const params = [parsed.data.restaurantId];
     let sql = `
-      SELECT o.id, o.restaurant_id, o.customer_user_id, o.order_type, o.status, o.created_at, o.accepted_at,
+      SELECT o.id, o.restaurant_id, o.customer_user_id, o.order_type, o.token_number, o.status, o.created_at, o.accepted_at,
              o.cancelled_by, o.cancellation_reason, o.scheduled_delivery_date, o.scheduled_delivery_time,
              u.full_name AS customer_name, u.email AS customer_email,
              COALESCE(o.customer_contact_phone, sub.phone) AS customer_phone,
@@ -1921,6 +2080,7 @@ function orderRouter(io) {
     const orderId = Number(req.params.orderId);
     const restaurantId = Number(req.query.restaurantId || 0);
     if (!orderId) return res.status(400).json({ message: "orderId is required" });
+    await ensureTokenNumberColumn();
 
     let row;
     try {
@@ -1928,7 +2088,7 @@ function orderRouter(io) {
         const ctx = await resolveRestaurantTenantContext(req, restaurantId);
         if (ctx.error) return res.status(ctx.error.status).json({ message: ctx.error.message });
         const [[found]] = await pool.execute(
-          `SELECT o.id, o.status, o.order_type, o.created_at, o.table_id, rt.table_number,
+          `SELECT o.id, o.status, o.order_type, o.token_number, o.created_at, o.table_id, rt.table_number,
                   u.full_name AS customer_name, u.phone AS customer_phone, u.role AS customer_role,
                   (SELECT pay.payment_status FROM payments pay WHERE pay.order_id = o.id ORDER BY pay.id DESC LIMIT 1) AS payment_status,
                   (SELECT inv.invoice_number FROM invoices inv WHERE inv.order_id = o.id ORDER BY inv.id DESC LIMIT 1) AS invoice_number
@@ -1942,7 +2102,7 @@ function orderRouter(io) {
         row = found;
       } else {
         const [[found]] = await pool.execute(
-          `SELECT o.id, o.status, o.order_type, o.created_at, o.table_id, o.restaurant_id, o.tenant_id,
+          `SELECT o.id, o.status, o.order_type, o.token_number, o.created_at, o.table_id, o.restaurant_id, o.tenant_id,
                   rt.table_number, u.full_name AS customer_name, u.phone AS customer_phone, u.role AS customer_role,
                   (SELECT pay.payment_status FROM payments pay WHERE pay.order_id = o.id ORDER BY pay.id DESC LIMIT 1) AS payment_status,
                   (SELECT inv.invoice_number FROM invoices inv WHERE inv.order_id = o.id ORDER BY inv.id DESC LIMIT 1) AS invoice_number
@@ -1981,6 +2141,9 @@ function orderRouter(io) {
       customization: it.customization || null,
     }));
 
+    const tokenRaw = row.token_number != null ? Number(row.token_number) : null;
+    const tokenNumber = tokenRaw != null && Number.isFinite(tokenRaw) ? String(tokenRaw) : String(row.id);
+
     return res.json({
       order_id: row.id,
       order_type: orderType,
@@ -1989,7 +2152,7 @@ function orderRouter(io) {
       table_number: row.table_number || null,
       customer_name: row.customer_name || null,
       customer_phone: row.customer_phone || null,
-      token_number: String(Number(row.id) % 10000).padStart(4, "0"),
+      token_number: tokenNumber,
       items,
       subtotal: enriched.line_total || 0,
       created_at: row.created_at,

@@ -119,6 +119,7 @@ CREATE TABLE orders (
   customer_user_id BIGINT NOT NULL,
   table_id BIGINT NULL,
   order_type ENUM('DELIVERY','DINE_IN','TAKEAWAY') NOT NULL,
+  token_number INT NULL,
   status ENUM('PLACED','ACCEPTED','PREPARING','READY','OUT_FOR_DELIVERY','DELIVERED','CANCELLED') DEFAULT 'PLACED',
   scheduled_delivery_date DATE NULL,
   scheduled_delivery_time VARCHAR(5) NULL,

@@ -10,6 +10,7 @@ const { ensureStructuredAddressSchema } = require("./utils/ensureStructuredAddre
 const { ensurePasswordResetSchema } = require("./utils/ensurePasswordResetSchema");
 const { ensureUserProfileSchema } = require("./utils/ensureUserProfileSchema");
 const { ensureStaffSchema } = require("./modules/staff/ensureStaffSchema");
+const { ensureTableQrSchema } = require("./modules/tables/ensureTableQrSchema");
 const { startTrendingSyncJob } = require("./modules/portal/services/trendingSync");
 const { startOwnerAcceptTimeoutJob } = require("./services/ownerAcceptTimeout");
 const { warmSmtpConnection } = require("./services/mailer");
@@ -22,8 +23,9 @@ const io = new Server(server, {
       const allowed =
         !origin ||
         origin === env.frontendUrl ||
-        (env.nodeEnv !== "production" &&
-          /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(origin));
+        /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(origin) ||
+        /^capacitor:\/\/localhost$/i.test(origin) ||
+        /^ionic:\/\/localhost$/i.test(origin);
       callback(null, allowed);
     },
     credentials: true,
@@ -133,6 +135,7 @@ async function startServer() {
     await ensurePasswordResetSchema();
     await ensureUserProfileSchema();
     await ensureStaffSchema();
+    await ensureTableQrSchema();
     setImmediate(() => {
       warmSmtpConnection().catch(() => {});
     });

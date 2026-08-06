@@ -8,6 +8,8 @@ const analyticsRoutes = require("../modules/analytics/analytics.routes");
 const aiRoutes = require("../modules/ai/ai.routes");
 const adminRoutes = require("../modules/admin/admin.routes");
 const tableRoutes = require("../modules/tables/table.routes");
+const tablePublicRoutes = require("../modules/tables/table-public.routes");
+const tableCustomersRoutes = require("../modules/tables/table-customers.routes");
 const reservationRoutes = require("../modules/reservations/reservation.routes");
 const inventoryRoutes = require("../modules/inventory/inventory.routes");
 const billingRoutes = require("../modules/billing/billing.routes");
@@ -34,6 +36,8 @@ function createRouter(io) {
   router.use("/ai", aiRoutes);
   router.use("/admin", adminRoutes);
   router.use("/tables", tableRoutes(io));
+  router.use("/public/table-qr", tablePublicRoutes(io));
+  router.use("/table-customers", tableCustomersRoutes());
   router.use("/reservations", reservationRoutes);
   router.use("/inventory", inventoryRoutes);
   router.use("/billing", billingRoutes);

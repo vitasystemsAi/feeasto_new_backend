@@ -11,9 +11,27 @@ const YAML = require("yaml");
 const createRouter = require("./routes");
 const env = require("./config/env");
 
+function isNativeAppOrigin(origin) {
+  // Capacitor Android/iOS WebView origins (androidScheme: https → https://localhost)
+  return (
+    /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(origin) ||
+    /^capacitor:\/\/localhost$/i.test(origin) ||
+    /^ionic:\/\/localhost$/i.test(origin)
+  );
+}
+
 function isDevFrontendOrigin(origin) {
   if (!origin || env.nodeEnv === "production") return false;
-  return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(origin);
+  return isNativeAppOrigin(origin);
+}
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+  if (origin === env.frontendUrl) return true;
+  if (isDevFrontendOrigin(origin)) return true;
+  // Always allow Capacitor native app shells so mobile APKs can call the API.
+  if (isNativeAppOrigin(origin)) return true;
+  return false;
 }
 
 function createApp(io) {
@@ -28,7 +46,7 @@ function createApp(io) {
   app.use(
     cors({
       origin(origin, callback) {
-        if (!origin || origin === env.frontendUrl || isDevFrontendOrigin(origin)) {
+        if (isAllowedOrigin(origin)) {
           callback(null, true);
           return;
         }

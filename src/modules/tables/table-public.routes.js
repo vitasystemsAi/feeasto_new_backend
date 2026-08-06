@@ -12,17 +12,32 @@ function roundMoney(n) {
 }
 
 async function loadTableByToken(token) {
-  const [[row]] = await pool.execute(
-    `SELECT rt.id AS table_id, rt.table_number, rt.capacity, rt.status AS table_status,
-            rt.tenant_id, rt.restaurant_id, rt.qr_token,
-            r.name AS restaurant_name, r.is_online, r.approval_status, r.is_active
-     FROM restaurant_tables rt
-     INNER JOIN restaurants r ON r.id = rt.restaurant_id
-     WHERE rt.qr_token = ?
-     LIMIT 1`,
-    [token]
-  );
-  return row || null;
+  try {
+    const [[row]] = await pool.execute(
+      `SELECT rt.id AS table_id, rt.table_number, rt.capacity, rt.status AS table_status,
+              rt.tenant_id, rt.restaurant_id, rt.qr_token,
+              r.name AS restaurant_name, r.is_online, r.approval_status, r.is_active
+       FROM restaurant_tables rt
+       INNER JOIN restaurants r ON r.id = rt.restaurant_id
+       WHERE rt.qr_token = ?
+       LIMIT 1`,
+      [token]
+    );
+    return row || null;
+  } catch (error) {
+    if (error?.code !== "ER_BAD_FIELD_ERROR") throw error;
+    const [[row]] = await pool.execute(
+      `SELECT rt.id AS table_id, rt.table_number, rt.capacity, rt.status AS table_status,
+              rt.tenant_id, rt.restaurant_id, rt.qr_token,
+              r.name AS restaurant_name, 1 AS is_online, r.approval_status, r.is_active
+       FROM restaurant_tables rt
+       INNER JOIN restaurants r ON r.id = rt.restaurant_id
+       WHERE rt.qr_token = ?
+       LIMIT 1`,
+      [token]
+    );
+    return row || null;
+  }
 }
 
 function tablePublicRoutes(io) {
@@ -37,8 +52,14 @@ function tablePublicRoutes(io) {
     try {
       const table = await loadTableByToken(token);
       if (!table) return res.status(404).json({ message: "Table QR not found" });
-      if (Number(table.is_active) === 0 || String(table.approval_status || "").toUpperCase() !== "APPROVED") {
+      if (Number(table.is_active) === 0) {
         return res.status(403).json({ message: "This restaurant is not available for ordering right now." });
+      }
+      const approval = String(table.approval_status || "").toUpperCase();
+      if (approval && approval !== "APPROVED" && approval !== "VERIFIED") {
+        return res.status(403).json({
+          message: "This restaurant is not approved for customer ordering yet. Ask staff to take your order.",
+        });
       }
 
       let menuRows;
@@ -146,8 +167,14 @@ function tablePublicRoutes(io) {
       return res.status(500).json({ message: "Failed to resolve table", details: error.message });
     }
     if (!table) return res.status(404).json({ message: "Table QR not found" });
-    if (Number(table.is_active) === 0 || String(table.approval_status || "").toUpperCase() !== "APPROVED") {
+    if (Number(table.is_active) === 0) {
       return res.status(403).json({ message: "This restaurant is not available for ordering right now." });
+    }
+    const approval = String(table.approval_status || "").toUpperCase();
+    if (approval && approval !== "APPROVED" && approval !== "VERIFIED") {
+      return res.status(403).json({
+        message: "This restaurant is not approved for customer ordering yet. Ask staff to take your order.",
+      });
     }
     if (Number(table.is_online) === 0) {
       return res.status(403).json({ message: "Restaurant is offline. Please ask staff for help." });

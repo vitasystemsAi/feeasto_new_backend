@@ -7,6 +7,12 @@ const tenantScope = require("../../middlewares/tenant");
 const env = require("../../config/env");
 const { ensureTableHasQrToken, generateQrToken } = require("./ensureTableQrSchema");
 
+function buildPublicQrUrl(token) {
+  const frontendBase = String(env.frontendUrl || "").replace(/\/$/, "");
+  if (!token || !frontendBase) return null;
+  return `${frontendBase}/?table_qr=${encodeURIComponent(token)}`;
+}
+
 function normalizeStatus(status) {
   const upper = String(status || "").toUpperCase();
   if (upper === "RESERVED") return "BOOKED";
@@ -59,7 +65,6 @@ function tableRoutes(io) {
       }
     }
 
-    const frontendBase = String(env.frontendUrl || "").replace(/\/$/, "");
     const items = [];
     for (const row of rows) {
       let qrToken = row.qr_token;
@@ -73,7 +78,7 @@ function tableRoutes(io) {
       items.push({
         ...row,
         qr_token: qrToken,
-        qr_url: qrToken ? `${frontendBase}/t/${qrToken}` : null,
+        qr_url: buildPublicQrUrl(qrToken),
       });
     }
     return res.json({ items });
@@ -103,11 +108,10 @@ function tableRoutes(io) {
       );
     }
     io.to(`tenant:${req.tenantId}`).emit("table:updated", { tableId: result.insertId, action: "CREATED" });
-    const frontendBase = String(env.frontendUrl || "").replace(/\/$/, "");
     return res.status(201).json({
       id: result.insertId,
       qr_token: qrToken,
-      qr_url: `${frontendBase}/t/${qrToken}`,
+      qr_url: buildPublicQrUrl(qrToken),
     });
   });
 
@@ -127,13 +131,12 @@ function tableRoutes(io) {
     }
     if (!qrToken) return res.status(500).json({ message: "Could not allocate QR token" });
 
-    const frontendBase = String(env.frontendUrl || "").replace(/\/$/, "");
     return res.json({
       tableId: row.id,
       tableNumber: row.table_number,
       restaurantId: row.restaurant_id,
       qrToken,
-      qrUrl: `${frontendBase}/t/${qrToken}`,
+      qrUrl: buildPublicQrUrl(qrToken),
     });
   });
 
@@ -164,13 +167,12 @@ function tableRoutes(io) {
     }
     if (!qrToken) return res.status(500).json({ message: "Could not regenerate QR token" });
 
-    const frontendBase = String(env.frontendUrl || "").replace(/\/$/, "");
     io.to(`tenant:${req.tenantId}`).emit("table:updated", { tableId, action: "QR_REGENERATED" });
     return res.json({
       tableId,
       tableNumber: row.table_number,
       qrToken,
-      qrUrl: `${frontendBase}/t/${qrToken}`,
+      qrUrl: buildPublicQrUrl(qrToken),
     });
   });
 

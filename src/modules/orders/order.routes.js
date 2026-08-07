@@ -1600,7 +1600,7 @@ function orderRouter(io) {
     const orderId = Number(req.params.orderId);
 
     const [[order]] = await pool.execute(
-      `SELECT o.id, o.status, o.order_type, o.customer_user_id, o.tenant_id, o.restaurant_id,
+      `SELECT o.id, o.status, o.order_type, o.customer_user_id, o.tenant_id, o.restaurant_id, o.accepted_at,
               d.status AS delivery_status, r.owner_user_id,
               p.id AS delivery_partner_profile_id
        FROM orders o
@@ -1628,31 +1628,50 @@ function orderRouter(io) {
 
     const tenantId = Number(order.tenant_id);
     const hasDeliveryPartner = Boolean(order.delivery_partner_profile_id);
+    const currentStatus = String(order.status || "").toUpperCase();
+    const requestedStatus = String(parsed.data.status || "").toUpperCase();
 
     const orderType = String(order.order_type || "").toUpperCase();
-    if (orderType === "DELIVERY" && parsed.data.status === "DELIVERED") {
+    if (orderType === "DELIVERY" && requestedStatus === "DELIVERED") {
       return res.status(400).json({
         message: "Delivery orders are completed by the assigned delivery partner at the customer location.",
       });
     }
 
+    /** Idempotent: already at target (e.g. double-click Accept) — return current state. */
+    if (currentStatus === requestedStatus) {
+      const cancelRow = { ...order, status: currentStatus };
+      const payload = {
+        orderId,
+        status: currentStatus,
+        accepted_at: order.accepted_at || null,
+        ...buildStatusPayload(currentStatus, order.delivery_status, null, null, {
+          deliveryStatus: order.delivery_status,
+        }),
+        owner_next_actions: getOwnerNextActions(currentStatus, order.order_type, { hasDeliveryPartner }),
+        can_cancel: canCustomerCancelOrder(cancelRow),
+        cancel_deadline_at: customerCancelDeadlineIso(cancelRow),
+      };
+      return res.json({ message: "Order already in this status", ...payload });
+    }
+
     const allowed = getOwnerNextActions(order.status, order.order_type, { hasDeliveryPartner }).map(
       (a) => a.status
     );
-    if (!allowed.includes(parsed.data.status)) {
+    if (!allowed.includes(requestedStatus)) {
       return res.status(400).json({
         message: `Cannot move order from ${order.status} to ${parsed.data.status}.`,
       });
     }
 
     await ensureAcceptedAtColumn();
-    if (parsed.data.status === "ACCEPTED") {
+    if (requestedStatus === "ACCEPTED") {
       await pool.execute(
         "UPDATE orders SET status = ?, accepted_at = COALESCE(accepted_at, NOW()) WHERE id = ?",
-        [parsed.data.status, orderId]
+        [requestedStatus, orderId]
       );
     } else {
-      await pool.execute("UPDATE orders SET status = ? WHERE id = ?", [parsed.data.status, orderId]);
+      await pool.execute("UPDATE orders SET status = ? WHERE id = ?", [requestedStatus, orderId]);
     }
 
     const [[updated]] = await pool.execute(
@@ -1668,13 +1687,15 @@ function orderRouter(io) {
       [orderId]
     );
 
-    const cancelRow = { ...order, ...updated, status: parsed.data.status };
+    const cancelRow = { ...order, ...updated, status: requestedStatus };
     const payload = {
       orderId,
-      status: parsed.data.status,
+      status: requestedStatus,
       accepted_at: updated?.accepted_at || null,
-      ...buildStatusPayload(parsed.data.status, updated?.delivery_status || order.delivery_status),
-      owner_next_actions: getOwnerNextActions(parsed.data.status, order.order_type, {
+      ...buildStatusPayload(requestedStatus, updated?.delivery_status || order.delivery_status, null, null, {
+        deliveryStatus: updated?.delivery_status || order.delivery_status,
+      }),
+      owner_next_actions: getOwnerNextActions(requestedStatus, order.order_type, {
         hasDeliveryPartner: Boolean(updated?.delivery_partner_profile_id),
       }),
       can_cancel: canCustomerCancelOrder(cancelRow),

@@ -304,33 +304,65 @@ router.post("/register/verify-otp", async (req, res) => {
       await conn.rollback();
       return res.status(409).json({ message: "Email already exists. Please login with this email." });
     }
+
     const homeResolved = resolveCustomerHomeFromBody(parsed.data);
-    const home =
-      homeResolved && homeResolved.ok !== false
-        ? homeResolved
-        : {
-            homeAddress: null,
-            homeVillage: null,
-            homeCity: null,
-            homeDistrict: null,
-            homeState: null,
-            homeCountry: null,
-            homePincode: null,
-            homeLat: null,
-            homeLng: null,
-          };
+    const hasHome = Boolean(homeResolved && homeResolved.ok !== false && (homeResolved.homeCity || homeResolved.homeAddress));
+    const home = hasHome
+      ? homeResolved
+      : {
+          homeAddress: null,
+          homeVillage: null,
+          homeCity: null,
+          homeDistrict: null,
+          homeState: null,
+          homeCountry: null,
+          homePincode: null,
+          homeLat: null,
+          homeLng: null,
+        };
+
     const regPhoneRaw = otpRow.phone || null;
     const regPhoneParsed = regPhoneRaw ? validateIndianPhone(regPhoneRaw) : { ok: false };
     const regPhone = regPhoneParsed.ok ? regPhoneParsed.phone : null;
 
+    if (regPhone) {
+      try {
+        const [[phoneUser]] = await conn.execute(
+          "SELECT id FROM users WHERE phone = ? AND phone IS NOT NULL LIMIT 1",
+          [regPhone]
+        );
+        if (phoneUser) {
+          await conn.rollback();
+          return res.status(409).json({ message: "This mobile number is already registered." });
+        }
+      } catch (phoneErr) {
+        if (phoneErr?.code !== "ER_BAD_FIELD_ERROR") throw phoneErr;
+      }
+    }
+
+    // Prefer a minimal insert (no address). Address can be added later from profile/checkout.
+    // Avoid inserting NULL into home_country (NOT NULL DEFAULT 'India') which fails under strict SQL mode.
     let userInsert;
-    try {
-      [userInsert] = await conn.execute(
-        `INSERT INTO users (full_name, email, phone, password_hash, role, tenant_id, is_active,
-         home_address, home_village, home_city, home_district, home_state, home_country, home_pincode,
-         home_latitude, home_longitude)
-         VALUES (?, ?, ?, ?, 'CUSTOMER', NULL, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
+    const insertAttempts = [
+      {
+        sql: `INSERT INTO users (full_name, email, phone, password_hash, role, tenant_id, is_active)
+              VALUES (?, ?, ?, ?, 'CUSTOMER', NULL, 1)`,
+        params: [otpRow.full_name, email, regPhone, otpRow.password_hash],
+      },
+      {
+        sql: `INSERT INTO users (full_name, email, password_hash, role, tenant_id, is_active)
+              VALUES (?, ?, ?, 'CUSTOMER', NULL, 1)`,
+        params: [otpRow.full_name, email, otpRow.password_hash],
+      },
+    ];
+
+    if (hasHome) {
+      insertAttempts.unshift({
+        sql: `INSERT INTO users (full_name, email, phone, password_hash, role, tenant_id, is_active,
+               home_address, home_village, home_city, home_district, home_state, home_country, home_pincode,
+               home_latitude, home_longitude)
+               VALUES (?, ?, ?, ?, 'CUSTOMER', NULL, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        params: [
           otpRow.full_name,
           email,
           regPhone,
@@ -340,35 +372,42 @@ router.post("/register/verify-otp", async (req, res) => {
           home.homeCity,
           home.homeDistrict,
           home.homeState,
-          home.homeCountry,
+          home.homeCountry || "India",
           home.homePincode,
           home.homeLat,
           home.homeLng,
-        ]
-      );
-    } catch (userInsErr) {
-      if (userInsErr?.code !== "ER_BAD_FIELD_ERROR") throw userInsErr;
-      [userInsert] = await conn.execute(
-        `INSERT INTO users (full_name, email, password_hash, role, tenant_id, is_active,
-         home_address, home_village, home_city, home_district, home_state, home_country, home_pincode,
-         home_latitude, home_longitude)
-         VALUES (?, ?, ?, 'CUSTOMER', NULL, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          otpRow.full_name,
-          email,
-          otpRow.password_hash,
-          home.homeAddress,
-          home.homeVillage,
-          home.homeCity,
-          home.homeDistrict,
-          home.homeState,
-          home.homeCountry,
-          home.homePincode,
-          home.homeLat,
-          home.homeLng,
-        ]
-      );
+        ],
+      });
     }
+
+    let lastInsertError = null;
+    for (const attempt of insertAttempts) {
+      try {
+        [userInsert] = await conn.execute(attempt.sql, attempt.params);
+        lastInsertError = null;
+        break;
+      } catch (userInsErr) {
+        lastInsertError = userInsErr;
+        // Missing column / wrong ENUM → try next simpler shape
+        if (userInsErr?.code === "ER_BAD_FIELD_ERROR" || userInsErr?.code === "ER_TRUNCATED_WRONG_VALUE_FOR_FIELD") {
+          continue;
+        }
+        // Duplicate phone/email
+        if (userInsErr?.code === "ER_DUP_ENTRY") {
+          await conn.rollback();
+          const msg = String(userInsErr.message || "");
+          if (msg.toLowerCase().includes("phone")) {
+            return res.status(409).json({ message: "This mobile number is already registered." });
+          }
+          return res.status(409).json({ message: "Email already exists. Please login with this email." });
+        }
+        throw userInsErr;
+      }
+    }
+    if (!userInsert) {
+      throw lastInsertError || new Error("Could not create user account.");
+    }
+
     const userId = userInsert.insertId;
     if (userId && home.homeCity && home.homePincode) {
       try {
@@ -383,7 +422,7 @@ router.post("/register/verify-otp", async (req, res) => {
             home.homeCity,
             home.homeDistrict,
             home.homeState,
-            home.homeCountry,
+            home.homeCountry || "India",
             home.homePincode,
             home.homeAddress,
             home.homeLat,
@@ -391,35 +430,27 @@ router.post("/register/verify-otp", async (req, res) => {
           ]
         );
       } catch (addrErr) {
-        if (addrErr?.code === "ER_BAD_FIELD_ERROR") {
-          await conn.execute(
-            `INSERT INTO customer_saved_addresses
-             (user_id, label, village, city, district, state, country, pincode, address_line, latitude, longitude, is_default)
-             VALUES (?, 'HOME', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
-            [
-              userId,
-              home.homeVillage,
-              home.homeCity,
-              home.homeDistrict,
-              home.homeState,
-              home.homeCountry,
-              home.homePincode,
-              home.homeAddress,
-              home.homeLat,
-              home.homeLng,
-            ]
-          );
-        } else {
-          throw addrErr;
-        }
+        // Address is optional at register — do not fail account creation
+        // eslint-disable-next-line no-console
+        console.warn("[register-verify] saved address skipped:", addrErr.message);
       }
     }
     await conn.execute("DELETE FROM registration_otps WHERE email = ?", [email]);
     await conn.commit();
     return res.status(201).json({ message: "Registration successful. You can now login.", role: "CUSTOMER" });
   } catch (error) {
-    await conn.rollback();
-    return res.status(500).json({ message: "OTP verification failed due to server error.", details: error.message });
+    try {
+      await conn.rollback();
+    } catch (_rb) {
+      /* ignore */
+    }
+    // eslint-disable-next-line no-console
+    console.error("[register-verify] failed:", error.code || "", error.message);
+    return res.status(500).json({
+      message: "OTP verification failed due to server error.",
+      details: error.message,
+      code: error.code || undefined,
+    });
   } finally {
     conn.release();
   }

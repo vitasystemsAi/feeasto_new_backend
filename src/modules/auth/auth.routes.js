@@ -8,7 +8,6 @@ const env = require("../../config/env");
 const auth = require("../../middlewares/auth");
 const rbac = require("../../middlewares/rbac");
 const { sendRegistrationOtpEmail, smtpConfigured } = require("../../services/mailer");
-const { sendPasswordResetOtpSms } = require("../../services/sms");
 const { ensurePasswordResetSchema } = require("../../utils/ensurePasswordResetSchema");
 const {
   GENERIC_SENT_MSG,
@@ -226,7 +225,6 @@ router.post("/register/request-otp", async (req, res) => {
 
     let emailSent = false;
     let emailError = null;
-    let smsResult = { sent: false, reason: "not_attempted" };
 
     try {
       await sendRegistrationOtpEmail({
@@ -246,38 +244,20 @@ router.post("/register/request-otp", async (req, res) => {
       }
     }
 
-    try {
-      smsResult = await sendPasswordResetOtpSms({
-        to: phone,
-        otp,
-        expiresMinutes: env.otpTtlMinutes,
-      });
-      if (!smsResult.sent) {
-        // eslint-disable-next-line no-console
-        console.warn("[register-otp] SMS not delivered:", smsResult.reason, smsResult.details || "");
-      }
-    } catch (smsErr) {
-      smsResult = { sent: false, reason: "sms_error", details: smsErr.message };
-      // eslint-disable-next-line no-console
-      console.error("[register-otp] SMS failed:", smsErr.message);
-    }
-
-    if (!emailSent && !smsResult.sent) {
+    if (!emailSent) {
       return res.status(503).json({
         message:
-          "Could not deliver OTP by email or SMS. Configure SMTP (SMTP_USER, SMTP_PASS, SMTP_FROM_EMAIL) and/or TWOFACTOR_API_KEY on the server, then try again.",
+          "Could not deliver OTP by email. Configure SMTP (SMTP_USER, SMTP_PASS, SMTP_FROM_EMAIL) on the server, then try again.",
         details: {
           email: emailError || (!smtpConfigured() ? "smtp_not_configured" : "email_failed"),
-          sms: smsResult.reason || "sms_failed",
         },
       });
     }
 
-    const channels = [emailSent ? "email" : null, smsResult.sent ? "mobile" : null].filter(Boolean);
     return res.status(200).json({
-      message: `Verification code sent to your ${channels.join(" and ")}. Enter it to complete registration.`,
+      message: "Verification code sent to your email. Enter it to complete registration.",
       expiresInMinutes: env.otpTtlMinutes,
-      deliveredVia: channels,
+      deliveredVia: ["email"],
     });
   } catch (error) {
     return res.status(500).json({
@@ -324,14 +304,21 @@ router.post("/register/verify-otp", async (req, res) => {
       await conn.rollback();
       return res.status(409).json({ message: "Email already exists. Please login with this email." });
     }
-    const home = resolveCustomerHomeFromBody(parsed.data);
-    if (!home || home.ok === false) {
-      await conn.rollback();
-      return res.status(400).json({
-        message: "Delivery address is required (village, city, district, state, pincode).",
-        errors: home?.errors,
-      });
-    }
+    const homeResolved = resolveCustomerHomeFromBody(parsed.data);
+    const home =
+      homeResolved && homeResolved.ok !== false
+        ? homeResolved
+        : {
+            homeAddress: null,
+            homeVillage: null,
+            homeCity: null,
+            homeDistrict: null,
+            homeState: null,
+            homeCountry: null,
+            homePincode: null,
+            homeLat: null,
+            homeLng: null,
+          };
     const regPhoneRaw = otpRow.phone || null;
     const regPhoneParsed = regPhoneRaw ? validateIndianPhone(regPhoneRaw) : { ok: false };
     const regPhone = regPhoneParsed.ok ? regPhoneParsed.phone : null;

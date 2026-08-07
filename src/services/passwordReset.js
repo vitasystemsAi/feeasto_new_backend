@@ -4,11 +4,10 @@ const jwt = require("jsonwebtoken");
 const pool = require("../db/pool");
 const env = require("../config/env");
 const { sendPasswordResetOtpEmail } = require("./mailer");
-const { sendPasswordResetOtpSms } = require("./sms");
 const { normalizeIndianPhone } = require("../utils/phone");
 
 const GENERIC_SENT_MSG =
-  "If an account exists, a verification code has been sent to your registered email and mobile number.";
+  "If an account exists, a verification code has been sent to your registered email.";
 
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
@@ -177,38 +176,24 @@ async function issueOtpForUser(user, { isResend = false } = {}) {
   return { expiresInMinutes: env.resetOtpTtlMinutes, maskedEmail: maskEmail(user.email), maskedPhone: maskPhone(phone) };
 }
 
-/** Send email/SMS without blocking the HTTP response (SMTP can be slow). */
-function dispatchResetNotifications(user, otp, phone) {
+/** Send email OTP without blocking the HTTP response (SMTP can be slow). */
+function dispatchResetNotifications(user, otp, _phone) {
   setImmediate(() => {
     (async () => {
-      const tasks = [
-        sendPasswordResetOtpEmail({
+      try {
+        await sendPasswordResetOtpEmail({
           to: user.email,
           otp,
           expiresInMinutes: env.resetOtpTtlMinutes,
-        }).catch((emailErr) => {
-          // eslint-disable-next-line no-console
-          console.error("[password-reset] Email failed:", emailErr.message);
-          if (env.nodeEnv !== "production") {
-            // eslint-disable-next-line no-console
-            console.log(`[password-reset-dev] OTP for ${user.email}: ${otp}`);
-          }
-        }),
-      ];
-      if (phone) {
-        tasks.push(
-          sendPasswordResetOtpSms({ to: phone, otp, expiresMinutes: env.resetOtpTtlMinutes }).then((smsResult) => {
-            if (!smsResult.sent) {
-              // eslint-disable-next-line no-console
-              console.warn("[password-reset] SMS not delivered:", smsResult.reason, smsResult.details || "");
-            }
-          })
-        );
-      } else {
+        });
+      } catch (emailErr) {
         // eslint-disable-next-line no-console
-        console.warn("[password-reset] No mobile on file for user", user.email);
+        console.error("[password-reset] Email failed:", emailErr.message);
+        if (env.nodeEnv !== "production") {
+          // eslint-disable-next-line no-console
+          console.log(`[password-reset-dev] OTP for ${user.email}: ${otp}`);
+        }
       }
-      await Promise.allSettled(tasks);
     })();
   });
 }

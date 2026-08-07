@@ -141,9 +141,7 @@ async function startServer() {
     });
     if (!smsConfigured()) {
       // eslint-disable-next-line no-console
-      console.warn(
-        "[sms] No SMS provider configured — OTPs go to email only. Add TWOFACTOR_API_KEY (free test credits) or FAST2SMS_API_KEY to backend/.env"
-      );
+      console.log("[sms] SMS provider not configured — OTP delivery is email-only.");
     }
     startTrendingSyncJob();
     startOwnerAcceptTimeoutJob(io);

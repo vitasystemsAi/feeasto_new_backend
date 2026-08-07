@@ -35,10 +35,25 @@ function isOrderHandedToDriver(orderStatus) {
   return o === "OUT_FOR_DELIVERY" || o === "DELIVERED";
 }
 
+function bothHandoffsComplete(row) {
+  return Boolean(row?.restaurant_handoff_at) && Boolean(row?.partner_pickup_at);
+}
+
+async function completeDualHandoff(conn, { deliveryId, orderId, tenantId }) {
+  await conn.execute(
+    "UPDATE deliveries SET status = 'PICKED_UP' WHERE id = ? AND status <> 'DELIVERED'",
+    [deliveryId]
+  );
+  await conn.execute(
+    "UPDATE orders SET status = 'OUT_FOR_DELIVERY' WHERE id = ? AND status IN ('READY', 'OUT_FOR_DELIVERY')",
+    [orderId]
+  );
+}
+
 function enrichPartnerAssignment(row) {
   const orderStatus = String(row.order_status || "").toUpperCase();
   const deliveryStatus = String(row.delivery_status || "").toUpperCase();
-  const handedOff = isOrderHandedToDriver(orderStatus);
+  const handedOff = isOrderHandedToDriver(orderStatus) || deliveryStatus === "PICKED_UP";
   const customerDeliveryAddress =
     row.order_delivery_address ||
     formatCustomerDeliveryAddress(row.customer_address, row.customer_pincode) ||
@@ -62,6 +77,8 @@ function enrichPartnerAssignment(row) {
 
   return {
     ...row,
+    restaurant_handoff_at: row.restaurant_handoff_at || null,
+    partner_pickup_at: row.partner_pickup_at || null,
     customer_delivery_address: customerDeliveryAddress,
     customer_contact_visible: handedOff,
     customer_name: handedOff ? row.customer_name : null,
@@ -71,7 +88,7 @@ function enrichPartnerAssignment(row) {
     restaurant_longitude,
     customer_latitude,
     customer_longitude,
-    can_pickup: handedOff && deliveryStatus === "ACCEPTED",
+    can_pickup: deliveryStatus === "ACCEPTED",
   };
 }
 
@@ -175,7 +192,7 @@ function deliveryRouter(io) {
       }
       deliveryId = existing[0].id;
       await pool.execute(
-        "UPDATE deliveries SET delivery_partner_id = ?, status = 'ASSIGNED', tenant_id = ? WHERE id = ?",
+        "UPDATE deliveries SET delivery_partner_id = ?, status = 'ASSIGNED', tenant_id = ?, restaurant_handoff_at = NULL, partner_pickup_at = NULL WHERE id = ?",
         [partnerId, tenantId, deliveryId]
       );
     } else {
@@ -186,28 +203,30 @@ function deliveryRouter(io) {
       deliveryId = result.insertId;
     }
 
-    await pool.execute(
-      "UPDATE orders SET status = 'OUT_FOR_DELIVERY' WHERE id = ? AND status = 'READY'",
-      [orderId]
-    );
-
     const [[partnerUser]] = await pool.execute(
-      `SELECT u.full_name AS delivery_partner_name
+      `SELECT u.full_name AS delivery_partner_name, p.phone AS delivery_partner_phone,
+              p.vehicle_number AS delivery_partner_vehicle
        FROM restaurant_delivery_partner_profiles p
        INNER JOIN users u ON u.id = p.user_id
        WHERE p.id = ? LIMIT 1`,
       [profileId]
     );
 
-    const statusPayload = buildStatusPayload("OUT_FOR_DELIVERY", "ASSIGNED");
-    const ownerActions = getOwnerNextActions("OUT_FOR_DELIVERY", orderType, {
+    const statusPayload = buildStatusPayload("READY", "ASSIGNED", null, null, {
+      restaurantHandoffAt: null,
+      partnerPickupAt: null,
+    });
+    const ownerActions = getOwnerNextActions("READY", orderType, {
       hasDeliveryPartner: true,
     });
     const assignPayload = {
       orderId,
-      status: "OUT_FOR_DELIVERY",
+      status: "READY",
+      deliveryStatus: "ASSIGNED",
       deliveryPartnerProfileId: profileId,
       deliveryPartnerName: partnerUser?.delivery_partner_name || null,
+      deliveryPartnerPhone: partnerUser?.delivery_partner_phone || null,
+      deliveryPartnerVehicle: partnerUser?.delivery_partner_vehicle || null,
       owner_next_actions: ownerActions,
       can_cancel: false,
       cancel_deadline_at: null,
@@ -242,15 +261,123 @@ function deliveryRouter(io) {
     }
 
     return res.json({
-      message: "Delivery partner assigned.",
+      message: "Delivery partner assigned. Waiting for partner to accept.",
       deliveryId,
       deliveryPartnerId: partnerId,
       deliveryPartnerProfileId: profileId,
       deliveryPartnerName: partnerUser?.delivery_partner_name || null,
       orderId,
-      status: "OUT_FOR_DELIVERY",
+      status: "READY",
+      deliveryStatus: "ASSIGNED",
       owner_next_actions: ownerActions,
       ...statusPayload,
+    });
+  });
+
+  /** Restaurant confirms the bag was handed to the partner (dual confirm with partner pickup). */
+  router.post("/handoff", auth(), rbac("OWNER", "MANAGER", "ADMIN"), async (req, res) => {
+    const schema = z.object({
+      orderId: z.coerce.number().int().positive(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ errors: parsed.error.issues });
+
+    const orderId = parsed.data.orderId;
+    const [[order]] = await pool.execute(
+      `SELECT o.id, o.restaurant_id, o.tenant_id, o.order_type, o.status, o.customer_user_id, r.owner_user_id,
+              d.id AS delivery_id, d.status AS delivery_status,
+              d.restaurant_handoff_at, d.partner_pickup_at,
+              p.id AS delivery_partner_profile_id,
+              pu.full_name AS delivery_partner_name,
+              p.phone AS delivery_partner_phone,
+              p.vehicle_number AS delivery_partner_vehicle
+       FROM orders o
+       INNER JOIN restaurants r ON r.id = o.restaurant_id
+       LEFT JOIN deliveries d ON d.order_id = o.id
+       LEFT JOIN delivery_partners dp ON dp.id = d.delivery_partner_id
+       LEFT JOIN restaurant_delivery_partner_profiles p
+         ON p.delivery_partner_id = dp.id AND p.restaurant_id = o.restaurant_id AND p.tenant_id = o.tenant_id
+       LEFT JOIN users pu ON pu.id = p.user_id
+       WHERE o.id = ?
+       LIMIT 1`,
+      [orderId]
+    );
+    if (!order) return res.status(404).json({ message: "Order not found." });
+    if (String(order.order_type || "").toUpperCase() !== "DELIVERY") {
+      return res.status(400).json({ message: "Only delivery orders support pickup handoff." });
+    }
+    if (req.user.role === "OWNER" && Number(order.owner_user_id) !== Number(req.user.sub)) {
+      return res.status(403).json({ message: "You can only confirm handoff for your restaurants." });
+    }
+    if (!order.delivery_id) {
+      return res.status(400).json({ message: "Assign a delivery partner first." });
+    }
+    const ds = String(order.delivery_status || "").toUpperCase();
+    if (!["ACCEPTED", "PICKED_UP"].includes(ds)) {
+      return res.status(400).json({
+        message: "Wait until the delivery partner accepts, then confirm the handoff.",
+      });
+    }
+
+    const tenantId = Number(order.tenant_id);
+    let finalOrderStatus = String(order.status || "").toUpperCase();
+    let finalDeliveryStatus = ds;
+    const partnerAlreadyPicked = Boolean(order.partner_pickup_at);
+
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await conn.execute(
+        "UPDATE deliveries SET restaurant_handoff_at = COALESCE(restaurant_handoff_at, NOW()) WHERE id = ?",
+        [order.delivery_id]
+      );
+      if (partnerAlreadyPicked || ds === "PICKED_UP") {
+        await completeDualHandoff(conn, {
+          deliveryId: order.delivery_id,
+          orderId,
+          tenantId,
+        });
+        finalOrderStatus = "OUT_FOR_DELIVERY";
+        finalDeliveryStatus = "PICKED_UP";
+      }
+      await conn.commit();
+    } catch (error) {
+      await conn.rollback();
+      return res.status(500).json({ message: "Failed to confirm handoff", details: error.message });
+    } finally {
+      conn.release();
+    }
+
+    const statusPayload = buildStatusPayload(finalOrderStatus, finalDeliveryStatus, null, null, {
+      restaurantHandoffAt: true,
+      partnerPickupAt: partnerAlreadyPicked || finalDeliveryStatus === "PICKED_UP",
+    });
+    const payload = {
+      orderId,
+      status: finalOrderStatus,
+      deliveryStatus: finalDeliveryStatus,
+      restaurant_handoff_at: new Date().toISOString(),
+      partner_pickup_at: partnerAlreadyPicked ? order.partner_pickup_at : null,
+      deliveryPartnerProfileId: order.delivery_partner_profile_id,
+      deliveryPartnerName: order.delivery_partner_name,
+      deliveryPartnerPhone: order.delivery_partner_phone,
+      deliveryPartnerVehicle: order.delivery_partner_vehicle,
+      ...statusPayload,
+    };
+
+    if (io) {
+      io.to(`tenant:${tenantId}`).emit("delivery:updated", payload);
+      io.to(`tenant:${tenantId}`).emit("order:status-updated", payload);
+      if (order.customer_user_id) {
+        io.to(`user:${order.customer_user_id}`).emit("order:status-updated", payload);
+      }
+    }
+
+    return res.json({
+      message: finalOrderStatus === "OUT_FOR_DELIVERY"
+        ? "Handoff complete. Order is on the way."
+        : "Restaurant handoff confirmed. Waiting for partner to mark picked up.",
+      ...payload,
     });
   });
 
@@ -289,6 +416,7 @@ function deliveryRouter(io) {
 
     let sql = `
       SELECT d.id AS delivery_id, d.status AS delivery_status, d.eta_minutes, d.delivery_partner_id,
+             d.restaurant_handoff_at, d.partner_pickup_at,
              o.id AS order_id, o.status AS order_status, o.order_type, o.created_at AS order_created_at,
              o.scheduled_delivery_date, o.scheduled_delivery_time,
              o.delivery_address AS order_delivery_address,
@@ -430,16 +558,24 @@ function deliveryRouter(io) {
 
     const deliveryId = Number(req.params.deliveryId);
     const [[row]] = await pool.execute(
-      `SELECT d.id, d.status, d.order_id, o.status AS order_status, o.customer_user_id,
+      `SELECT d.id, d.status, d.order_id, d.restaurant_handoff_at, d.partner_pickup_at,
+              o.status AS order_status, o.customer_user_id, o.order_type,
               o.delivery_latitude AS order_delivery_latitude, o.delivery_longitude AS order_delivery_longitude,
               cu.home_latitude AS customer_home_latitude, cu.home_longitude AS customer_home_longitude,
               r.latitude AS restaurant_latitude, r.longitude AS restaurant_longitude,
-              dp.current_lat AS partner_lat, dp.current_lng AS partner_lng
+              dp.current_lat AS partner_lat, dp.current_lng AS partner_lng,
+              p.id AS delivery_partner_profile_id,
+              pu.full_name AS delivery_partner_name,
+              p.phone AS delivery_partner_phone,
+              p.vehicle_number AS delivery_partner_vehicle
        FROM deliveries d
        INNER JOIN orders o ON o.id = d.order_id
        INNER JOIN restaurants r ON r.id = o.restaurant_id
        INNER JOIN users cu ON cu.id = o.customer_user_id
        INNER JOIN delivery_partners dp ON dp.id = d.delivery_partner_id
+       LEFT JOIN restaurant_delivery_partner_profiles p
+         ON p.delivery_partner_id = dp.id AND p.restaurant_id = o.restaurant_id AND p.tenant_id = o.tenant_id
+       LEFT JOIN users pu ON pu.id = p.user_id
        WHERE d.id = ? AND d.delivery_partner_id = ? AND d.tenant_id = ?
        LIMIT 1`,
       [deliveryId, partnerId, req.tenantId]
@@ -450,6 +586,8 @@ function deliveryRouter(io) {
     const current = String(row.status);
     let nextDeliveryStatus = null;
     let nextOrderStatus = null;
+    let setPartnerPickupAt = false;
+    let finalizeDualHandoff = false;
 
     if (action === "accept") {
       if (!["ASSIGNED"].includes(current)) {
@@ -466,12 +604,6 @@ function deliveryRouter(io) {
     } else if (action === "pickup") {
       if (current !== "ACCEPTED") {
         return res.status(400).json({ message: "Accept the delivery first, then pick up at the restaurant." });
-      }
-      const orderSt = String(row.order_status || "").toUpperCase();
-      if (!isOrderHandedToDriver(orderSt)) {
-        return res.status(400).json({
-          message: "This order is not ready for pickup yet. Wait until the restaurant assigns you.",
-        });
       }
 
       const partnerLat = parsed.data.lat ?? row.partner_lat;
@@ -510,12 +642,18 @@ function deliveryRouter(io) {
         ]);
       }
 
-      nextDeliveryStatus = "PICKED_UP";
-      if (["OUT_FOR_DELIVERY"].includes(orderSt)) {
-        nextOrderStatus = ORDER_STATUS_BY_DELIVERY.PICKED_UP;
+      setPartnerPickupAt = true;
+      if (row.restaurant_handoff_at) {
+        finalizeDualHandoff = true;
+        nextDeliveryStatus = "PICKED_UP";
+        nextOrderStatus = "OUT_FOR_DELIVERY";
+      } else {
+        /* Keep ACCEPTED until restaurant also confirms handoff. */
+        nextDeliveryStatus = "ACCEPTED";
+        nextOrderStatus = null;
       }
     } else if (action === "delivered") {
-      if (current !== "PICKED_UP") {
+      if (current !== "PICKED_UP" && !(current === "ACCEPTED" && bothHandoffsComplete(row))) {
         return res.status(400).json({
           message: "Mark picked up at the restaurant before completing delivery.",
         });
@@ -562,8 +700,21 @@ function deliveryRouter(io) {
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
-      await conn.execute("UPDATE deliveries SET status = ? WHERE id = ?", [nextDeliveryStatus, deliveryId]);
-      if (nextOrderStatus) {
+      if (setPartnerPickupAt) {
+        await conn.execute(
+          "UPDATE deliveries SET partner_pickup_at = COALESCE(partner_pickup_at, NOW()), status = ? WHERE id = ?",
+          [nextDeliveryStatus, deliveryId]
+        );
+      } else {
+        await conn.execute("UPDATE deliveries SET status = ? WHERE id = ?", [nextDeliveryStatus, deliveryId]);
+      }
+      if (finalizeDualHandoff) {
+        await completeDualHandoff(conn, {
+          deliveryId,
+          orderId: row.order_id,
+          tenantId: req.tenantId,
+        });
+      } else if (nextOrderStatus) {
         await conn.execute("UPDATE orders SET status = ? WHERE id = ? AND tenant_id = ?", [
           nextOrderStatus,
           row.order_id,
@@ -579,7 +730,12 @@ function deliveryRouter(io) {
     }
 
     const finalOrderStatus = nextOrderStatus || row.order_status;
-    const statusPayload = buildStatusPayload(finalOrderStatus, nextDeliveryStatus);
+    const restaurantHandoff = Boolean(row.restaurant_handoff_at) || finalizeDualHandoff;
+    const partnerPickup = setPartnerPickupAt || Boolean(row.partner_pickup_at);
+    const statusPayload = buildStatusPayload(finalOrderStatus, nextDeliveryStatus, null, null, {
+      restaurantHandoffAt: restaurantHandoff,
+      partnerPickupAt: partnerPickup,
+    });
 
     if (io) {
       const payload = {
@@ -587,6 +743,13 @@ function deliveryRouter(io) {
         orderId: row.order_id,
         deliveryStatus: nextDeliveryStatus,
         orderStatus: finalOrderStatus,
+        status: finalOrderStatus,
+        restaurant_handoff_at: restaurantHandoff ? row.restaurant_handoff_at || new Date().toISOString() : null,
+        partner_pickup_at: partnerPickup ? new Date().toISOString() : null,
+        deliveryPartnerProfileId: row.delivery_partner_profile_id,
+        deliveryPartnerName: row.delivery_partner_name,
+        deliveryPartnerPhone: row.delivery_partner_phone,
+        deliveryPartnerVehicle: row.delivery_partner_vehicle,
         ...statusPayload,
       };
       io.to(`tenant:${req.tenantId}`).emit("delivery:updated", payload);
@@ -597,9 +760,13 @@ function deliveryRouter(io) {
     }
 
     return res.json({
-      message: "Delivery updated",
+      message:
+        action === "pickup" && !finalizeDualHandoff
+          ? "Pickup recorded. Waiting for restaurant to confirm handoff."
+          : "Delivery updated",
       deliveryStatus: nextDeliveryStatus,
       orderStatus: finalOrderStatus,
+      waitingForRestaurantHandoff: action === "pickup" && !finalizeDualHandoff,
       ...statusPayload,
     });
   });
@@ -622,11 +789,29 @@ function deliveryRouter(io) {
     ]);
 
     if (io) {
-      io.to(`tenant:${req.tenantId}`).emit("delivery:location", {
+      const locationPayload = {
         deliveryPartnerId: partnerId,
         lat: parsed.data.lat,
         lng: parsed.data.lng,
-      });
+      };
+      io.to(`tenant:${req.tenantId}`).emit("delivery:location", locationPayload);
+
+      const [active] = await pool.execute(
+        `SELECT d.order_id, o.customer_user_id
+         FROM deliveries d
+         INNER JOIN orders o ON o.id = d.order_id
+         WHERE d.delivery_partner_id = ?
+           AND d.status IN ('ACCEPTED', 'PICKED_UP')
+           AND o.status IN ('READY', 'OUT_FOR_DELIVERY')`,
+        [partnerId]
+      );
+      for (const row of active) {
+        if (!row.customer_user_id) continue;
+        io.to(`user:${row.customer_user_id}`).emit("delivery:location", {
+          ...locationPayload,
+          orderId: row.order_id,
+        });
+      }
     }
 
     return res.json({ message: "Location updated", ...parsed.data });

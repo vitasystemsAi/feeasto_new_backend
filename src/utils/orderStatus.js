@@ -105,47 +105,127 @@ function getOwnerDisplayStatusLabel(orderStatus, cancelledBy, cancellationReason
   if (o === "CANCELLED") {
     return "Cancelled";
   }
-  return getOwnerOrderStatusLabel(orderStatus);
+  return getOwnerOrderStatusLabel(orderStatus, extras.deliveryStatus || extras.delivery_status);
 }
 
-/** Customer-facing label (4-step flow: placed → accepted → ready → delivered). */
+/** Customer-facing live tracking status (delivery-first 5-step progress). */
 function getCustomerOrderStatus(orderStatus, deliveryStatus, cancelledBy, cancellationReason, extras = {}) {
   const o = String(orderStatus || "PLACED").toUpperCase();
   const d = String(deliveryStatus || "").toUpperCase();
+  const restaurantHandoff = Boolean(extras.restaurantHandoffAt || extras.restaurant_handoff_at);
+  const partnerPickup = Boolean(extras.partnerPickupAt || extras.partner_pickup_at);
+  const bothHandoffs = restaurantHandoff && partnerPickup;
 
   if (o === "CANCELLED" || d === "REJECTED") {
     return {
       key: "CANCELLED",
       label: customerCancelledLabel(cancelledBy, cancellationReason, extras),
+      description: "This order was cancelled.",
+      progress: 0,
+      tone: "red",
       phase: "done",
+      icon: "cancelled",
     };
   }
+
   if (o === "DELIVERED" || d === "DELIVERED") {
-    return { key: "DELIVERED", label: "Delivered", phase: "done" };
+    return {
+      key: "DELIVERED",
+      label: "Order Delivered Successfully",
+      description: "Enjoy your meal! Thank you for ordering with us.",
+      progress: 100,
+      tone: "emerald",
+      phase: "done",
+      icon: "delivered",
+    };
   }
-  if (o === "OUT_FOR_DELIVERY" || d === "PICKED_UP") {
-    return { key: "OUT_FOR_DELIVERY", label: "On the way", phase: "transit" };
+
+  /* On the way only after dual handoff, or legacy OUT_FOR_DELIVERY / PICKED_UP. */
+  if (
+    o === "OUT_FOR_DELIVERY" ||
+    d === "PICKED_UP" ||
+    (bothHandoffs && ["ACCEPTED", "PICKED_UP"].includes(d))
+  ) {
+    return {
+      key: "OUT_FOR_DELIVERY",
+      label: "Your Order is On the Way",
+      description: "Your order has been picked up and is on its way to your location.",
+      progress: 85,
+      tone: "green",
+      phase: "transit",
+      icon: "on_the_way",
+    };
   }
+
+  if (d === "ACCEPTED") {
+    return {
+      key: "PARTNER_EN_ROUTE",
+      label: "Delivery Partner is Going to Pick Up Your Order",
+      description:
+        "Your delivery partner has accepted the order and is heading to the restaurant.",
+      progress: 60,
+      tone: "purple",
+      phase: "pickup",
+      icon: "partner_pickup",
+      waitingForHandoff: !bothHandoffs,
+      restaurantHandoffConfirmed: restaurantHandoff,
+      partnerPickupConfirmed: partnerPickup,
+    };
+  }
+
   if (o === "READY") {
-    return { key: "READY", label: "Ready", phase: "kitchen" };
+    const waitingPartner = !d || d === "ASSIGNED";
+    return {
+      key: "READY",
+      label: "Your Food is Ready",
+      description: waitingPartner
+        ? d === "ASSIGNED"
+          ? "Waiting for your delivery partner to accept the delivery."
+          : "Your food has been prepared successfully. Waiting for a delivery partner to accept the delivery."
+        : "Your food has been prepared successfully.",
+      progress: 45,
+      tone: "blue",
+      phase: "kitchen",
+      icon: "ready",
+      waitingForPartner: waitingPartner,
+    };
   }
-  if (o === "PREPARING") {
-    return { key: "PREPARING", label: "Preparing your food", phase: "kitchen" };
+
+  if (o === "PREPARING" || o === "ACCEPTED") {
+    return {
+      key: "PREPARING",
+      label: "Order is Being Prepared",
+      description: "Your order has been accepted by the restaurant and is now being prepared.",
+      progress: 25,
+      tone: "orange",
+      phase: "kitchen",
+      icon: "preparing",
+    };
   }
-  if (o === "ACCEPTED") {
-    return { key: "ACCEPTED", label: "Accepted", phase: "kitchen" };
-  }
-  return { key: "PLACED", label: "Order placed", phase: "new" };
+
+  return {
+    key: "PLACED",
+    label: "Order Placed",
+    description: "We've received your order. Waiting for the restaurant to accept it.",
+    progress: 8,
+    tone: "slate",
+    phase: "new",
+    icon: "placed",
+  };
 }
 
-function getOwnerOrderStatusLabel(orderStatus) {
+function getOwnerOrderStatusLabel(orderStatus, deliveryStatus) {
   const o = String(orderStatus || "").toUpperCase();
+  const d = String(deliveryStatus || "").toUpperCase();
+  if (o === "OUT_FOR_DELIVERY" || d === "PICKED_UP") return "On the way";
+  if (o === "READY" && d === "ACCEPTED") return "Partner en route to restaurant";
+  if (o === "READY" && d === "ASSIGNED") return "Waiting partner accept";
   const map = {
     PLACED: "New order",
     ACCEPTED: "Accepted",
     PREPARING: "Accepted",
     READY: "Ready",
-    OUT_FOR_DELIVERY: "Assigned to partner",
+    OUT_FOR_DELIVERY: "On the way",
     DELIVERED: "Delivered",
     CANCELLED: "Cancelled",
   };
@@ -192,7 +272,7 @@ function buildStatusPayload(orderStatus, deliveryStatus, cancelledBy, cancellati
     deliveryStatus,
     cancelledBy,
     cancellationReason,
-    extras
+    { ...extras, deliveryStatus }
   );
   return {
     orderStatus,
@@ -201,11 +281,15 @@ function buildStatusPayload(orderStatus, deliveryStatus, cancelledBy, cancellati
     cancellation_reason: cancellationReason || null,
     customerStatus: customer.label,
     customerStatusKey: customer.key,
+    customerStatusDescription: customer.description,
+    customerProgress: customer.progress,
+    customerTone: customer.tone,
+    customerIcon: customer.icon,
     ownerStatusLabel: getOwnerDisplayStatusLabel(
       orderStatus,
       cancelledBy,
       cancellationReason,
-      extras
+      { ...extras, deliveryStatus }
     ),
   };
 }

@@ -347,7 +347,12 @@ function enrichOrderRow(row, itemsByOrder) {
     row.status,
     row.delivery_status,
     row.cancelled_by,
-    row.cancellation_reason
+    row.cancellation_reason,
+    {
+      restaurantHandoffAt: row.restaurant_handoff_at,
+      partnerPickupAt: row.partner_pickup_at,
+      deliveryStatus: row.delivery_status,
+    }
   );
   const hasDeliveryPartner = Boolean(row.delivery_partner_profile_id);
   const paymentStatus = row.payment_status || null;
@@ -361,6 +366,10 @@ function enrichOrderRow(row, itemsByOrder) {
       normalizeTimeoutCancellationReason(row.cancellation_reason) || row.cancellation_reason || null,
     customer_status: statusMeta.customerStatus,
     customer_status_key: statusMeta.customerStatusKey,
+    customer_status_description: statusMeta.customerStatusDescription,
+    customer_progress: statusMeta.customerProgress,
+    customer_tone: statusMeta.customerTone,
+    customer_icon: statusMeta.customerIcon,
     owner_status_label: statusMeta.ownerStatusLabel,
     owner_next_actions: getOwnerNextActions(row.status, row.order_type, { hasDeliveryPartner }),
     can_cancel: canCustomerCancelOrder(row),
@@ -368,6 +377,10 @@ function enrichOrderRow(row, itemsByOrder) {
     scheduled_display: row.scheduled_delivery_date
       ? `${row.scheduled_delivery_date}${row.scheduled_delivery_time ? ` · ${row.scheduled_delivery_time}` : ""}`
       : null,
+    can_confirm_handoff:
+      String(row.order_type || "").toUpperCase() === "DELIVERY" &&
+      String(row.delivery_status || "").toUpperCase() === "ACCEPTED" &&
+      !row.restaurant_handoff_at,
   };
 }
 
@@ -1804,6 +1817,7 @@ function orderRouter(io) {
              u.full_name AS customer_name, u.email AS customer_email,
              COALESCE(o.customer_contact_phone, sub.phone) AS customer_phone,
              d.id AS delivery_id, d.status AS delivery_status, d.delivery_partner_id,
+             d.restaurant_handoff_at, d.partner_pickup_at,
              p.id AS delivery_partner_profile_id,
              pu.full_name AS delivery_partner_name,
              r.name AS restaurant_name,
@@ -2171,8 +2185,13 @@ function orderRouter(io) {
               o.delivery_address, o.delivery_latitude, o.delivery_longitude,
               r.name AS restaurant_name,
               d.status AS delivery_status, d.id AS delivery_id, d.eta_minutes,
+              d.restaurant_handoff_at, d.partner_pickup_at,
               p.id AS delivery_partner_profile_id,
               pu.full_name AS delivery_partner_name,
+              p.phone AS delivery_partner_phone,
+              p.vehicle_number AS delivery_partner_vehicle,
+              dp.current_lat AS delivery_partner_lat,
+              dp.current_lng AS delivery_partner_lng,
               (SELECT pay.payment_status FROM payments pay WHERE pay.order_id = o.id ORDER BY pay.id DESC LIMIT 1) AS payment_status
        FROM orders o
        INNER JOIN restaurants r ON r.id = o.restaurant_id

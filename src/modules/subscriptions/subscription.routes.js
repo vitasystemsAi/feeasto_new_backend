@@ -24,6 +24,7 @@ const {
   rescheduleDelivery,
   changeDeliveryItems,
 } = require("./customer-delivery.service");
+const { validateIndianPhone } = require("../../utils/phone");
 
 const router = express.Router();
 
@@ -907,6 +908,18 @@ router.post("/subscribers", auth(), tenantScope, rbac(...opsRoles), async (req, 
   if (!parsed.success) return res.status(400).json({ errors: parsed.error.issues });
 
   const d = parsed.data;
+  const phoneParsed = validateIndianPhone(d.phone);
+  if (!phoneParsed.ok) {
+    return res.status(400).json({ message: phoneParsed.message });
+  }
+  d.phone = phoneParsed.phone;
+  if (d.altPhone) {
+    const altParsed = validateIndianPhone(d.altPhone);
+    if (!altParsed.ok) {
+      return res.status(400).json({ message: "Enter a valid alternative mobile number." });
+    }
+    d.altPhone = altParsed.phone;
+  }
   if (d.planId) {
     const scheduleError = validateCustomSchedule(d.deliveryFrequency, d.deliverySchedule, d.deliveryDays);
     if (scheduleError) return res.status(400).json({ message: scheduleError });

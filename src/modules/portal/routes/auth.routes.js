@@ -224,7 +224,9 @@ router.patch("/me/profile", auth(), async (req, res) => {
         ? "Name must be at least 2 characters."
         : issue?.path?.[0] === "email"
           ? "Enter a valid email address."
-          : issue?.message || "Invalid profile details.";
+          : issue?.path?.[0] === "phone"
+            ? "Enter a valid 10-digit Indian mobile number."
+            : issue?.message || "Invalid profile details.";
     return res.status(400).json({ message, errors: parsed.error.issues });
   }
   try {

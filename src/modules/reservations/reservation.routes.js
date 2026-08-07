@@ -4,6 +4,7 @@ const pool = require("../../db/pool");
 const auth = require("../../middlewares/auth");
 const rbac = require("../../middlewares/rbac");
 const tenantScope = require("../../middlewares/tenant");
+const { validateIndianPhone } = require("../../utils/phone");
 
 const router = express.Router();
 
@@ -65,6 +66,11 @@ router.post("/", auth(), rbac("CUSTOMER", "OWNER", "MANAGER", "ADMIN", "SUPER_AD
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ errors: parsed.error.issues });
 
+  const phoneParsed = validateIndianPhone(parsed.data.mobileNumber);
+  if (!phoneParsed.ok) {
+    return res.status(400).json({ message: phoneParsed.message });
+  }
+
   const startTime = new Date(parsed.data.startTime);
   const endTime = new Date(parsed.data.endTime);
   if (!(startTime instanceof Date) || Number.isNaN(startTime.valueOf())) {
@@ -104,7 +110,7 @@ router.post("/", auth(), rbac("CUSTOMER", "OWNER", "MANAGER", "ADMIN", "SUPER_AD
         parsed.data.tableId,
         req.user.sub,
         parsed.data.customerName,
-        parsed.data.mobileNumber,
+        phoneParsed.phone,
         parsed.data.partySize,
         parsed.data.notes || null,
         startTime,

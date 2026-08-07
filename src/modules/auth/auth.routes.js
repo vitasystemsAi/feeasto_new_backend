@@ -145,7 +145,21 @@ function hashOtp(otp) {
 
 router.post("/register/request-otp", async (req, res) => {
   const parsed = registerRequestOtpSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ errors: parsed.error.issues });
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const path = issue?.path?.[0];
+    const message =
+      path === "email"
+        ? "Enter a valid email address."
+        : path === "mobile" || path === "phone"
+          ? "Enter a valid 10-digit Indian mobile number."
+          : path === "password" && issue?.code === "too_small"
+            ? "Password must be at least 8 characters."
+            : path === "fullName" && issue?.code === "too_small"
+              ? "Name must be at least 2 characters."
+              : issue?.message || "Invalid registration details.";
+    return res.status(400).json({ message, errors: parsed.error.issues });
+  }
 
   const fullName = parsed.data.fullName.trim();
   const email = normalizeEmail(parsed.data.email);
@@ -471,12 +485,65 @@ function validationMessage(issues) {
     return "Password must be at least 8 characters.";
   }
   if (first.path?.[0] === "email") return "Enter a valid email address.";
+  if (first.path?.[0] === "identifier" || first.path?.[0] === "mobile" || first.path?.[0] === "phone") {
+    return "Enter a valid email or mobile number.";
+  }
   return first.message || "Invalid login details.";
+}
+
+async function findUserForLogin(identifierRaw) {
+  const raw = String(identifierRaw || "").trim();
+  if (!raw) return null;
+
+  if (raw.includes("@")) {
+    const email = normalizeEmail(raw);
+    const [rows] = await pool.execute(
+      "SELECT id, full_name, email, password_hash, role, tenant_id FROM users WHERE email = ? AND is_active = 1 LIMIT 1",
+      [email]
+    );
+    return rows[0] || null;
+  }
+
+  const phoneParsed = validateIndianPhone(raw);
+  if (!phoneParsed.ok) return null;
+  const phone = phoneParsed.phone;
+
+  try {
+    const [rows] = await pool.execute(
+      "SELECT id, full_name, email, password_hash, role, tenant_id FROM users WHERE phone = ? AND is_active = 1 LIMIT 1",
+      [phone]
+    );
+    if (rows[0]) return rows[0];
+  } catch (err) {
+    if (err?.code !== "ER_BAD_FIELD_ERROR") throw err;
+  }
+
+  try {
+    const [rows] = await pool.execute(
+      `SELECT u.id, u.full_name, u.email, u.password_hash, u.role, u.tenant_id
+       FROM users u
+       INNER JOIN subscription_subscribers s ON s.user_id = u.id
+       WHERE s.phone = ? AND u.is_active = 1
+       LIMIT 1`,
+      [phone]
+    );
+    if (rows[0]) return rows[0];
+  } catch (err) {
+    if (err?.code !== "ER_BAD_FIELD_ERROR" && err?.code !== "ER_NO_SUCH_TABLE") throw err;
+  }
+
+  return null;
 }
 
 router.post("/login", async (req, res) => {
   try {
-    const schema = z.object({ email: z.string().email(), password: z.string().min(8) });
+    const schema = z.object({
+      identifier: z.string().min(3).optional(),
+      email: z.string().min(3).optional(),
+      mobile: z.string().min(3).optional(),
+      phone: z.string().min(3).optional(),
+      password: z.string().min(8),
+    });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({
@@ -485,12 +552,25 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    const { email, password } = parsed.data;
-    const [rows] = await pool.execute(
-      "SELECT id, full_name, email, password_hash, role, tenant_id FROM users WHERE email = ? AND is_active = 1",
-      [email]
-    );
-    const user = rows[0];
+    const identifier =
+      String(parsed.data.identifier || parsed.data.email || parsed.data.mobile || parsed.data.phone || "").trim();
+    if (!identifier) {
+      return res.status(400).json({ message: "Enter your email or mobile number." });
+    }
+    if (identifier.includes("@")) {
+      const emailOk = z.string().email().safeParse(normalizeEmail(identifier)).success;
+      if (!emailOk) {
+        return res.status(400).json({ message: "Enter a valid email address." });
+      }
+    } else {
+      const phoneParsed = validateIndianPhone(identifier);
+      if (!phoneParsed.ok) {
+        return res.status(400).json({ message: phoneParsed.message });
+      }
+    }
+
+    const { password } = parsed.data;
+    const user = await findUserForLogin(identifier);
     if (!user) return res.status(401).json({ message: "Invalid credentials" });
     if (!user.password_hash || typeof user.password_hash !== "string") {
       return res.status(401).json({ message: "Account password is not set. Please register again." });
@@ -596,7 +676,9 @@ router.patch("/me/profile", auth(), async (req, res) => {
         ? "Name must be at least 2 characters."
         : issue?.path?.[0] === "email"
           ? "Enter a valid email address."
-          : issue?.message || "Invalid profile details.";
+          : issue?.path?.[0] === "phone"
+            ? "Enter a valid 10-digit Indian mobile number."
+            : issue?.message || "Invalid profile details.";
     return res.status(400).json({ message, errors: parsed.error.issues });
   }
 
@@ -987,6 +1069,18 @@ router.post("/forgot-password", async (req, res) => {
   const id = parseIdentifierBody(req.body);
   if (id.length < 3) {
     return res.status(400).json({ message: "Enter a valid email or mobile number." });
+  }
+  const looksLikeEmail = id.includes("@");
+  if (looksLikeEmail) {
+    const emailOk = z.string().email().safeParse(id.trim().toLowerCase()).success;
+    if (!emailOk) {
+      return res.status(400).json({ message: "Enter a valid email address." });
+    }
+  } else {
+    const phoneParsed = validateIndianPhone(id);
+    if (!phoneParsed.ok) {
+      return res.status(400).json({ message: "Enter a valid 10-digit Indian mobile number." });
+    }
   }
   try {
     await ensurePasswordResetSchema();

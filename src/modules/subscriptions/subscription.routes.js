@@ -9,7 +9,9 @@ const auth = require("../../middlewares/auth");
 const rbac = require("../../middlewares/rbac");
 const tenantScope = require("../../middlewares/tenant");
 const {
+  allocateEmployeeId,
   ensureDeliveryPartnerRow,
+  syncRestaurantDeliveryStaffPartners,
   provisionSubscriberDelivery,
 } = require("../delivery/partner.service");
 const {
@@ -56,55 +58,12 @@ function fileUrl(req, field) {
   return file ? `/uploads/subscriptions/${file.filename}` : null;
 }
 
-function incrementLetterSeries(series) {
-  let a = series.charCodeAt(0);
-  let b = series.charCodeAt(1);
-  if (b < 90) return String.fromCharCode(a) + String.fromCharCode(b + 1);
-  if (a < 90) return String.fromCharCode(a + 1) + "A";
-  return "AA";
-}
-
 async function assertRestaurantAccess(tenantId, restaurantId) {
   const [rows] = await pool.execute(
     "SELECT id FROM restaurants WHERE id = ? AND tenant_id = ? LIMIT 1",
     [restaurantId, tenantId]
   );
   return rows[0] || null;
-}
-
-async function allocateEmployeeId(conn, restaurantId) {
-  const [existing] = await conn.execute(
-    "SELECT letter_series, next_number FROM partner_employee_id_counters WHERE restaurant_id = ? FOR UPDATE",
-    [restaurantId]
-  );
-
-  let letterSeries = "AA";
-  let nextNumber = 1;
-
-  if (existing[0]) {
-    letterSeries = existing[0].letter_series;
-    nextNumber = Number(existing[0].next_number);
-  } else {
-    await conn.execute(
-      "INSERT INTO partner_employee_id_counters (restaurant_id, letter_series, next_number) VALUES (?, 'AA', 1)",
-      [restaurantId]
-    );
-  }
-
-  const employeeId = `FAR-R${restaurantId}-${letterSeries}-${String(nextNumber).padStart(4, "0")}`;
-  let updatedSeries = letterSeries;
-  let updatedNumber = nextNumber + 1;
-  if (updatedNumber > 9999) {
-    updatedNumber = 1;
-    updatedSeries = incrementLetterSeries(letterSeries);
-  }
-
-  await conn.execute(
-    "UPDATE partner_employee_id_counters SET letter_series = ?, next_number = ? WHERE restaurant_id = ?",
-    [updatedSeries, updatedNumber, restaurantId]
-  );
-
-  return employeeId;
 }
 
 function normalizeEmail(email) {
@@ -612,6 +571,13 @@ router.get("/delivery-partners", auth(), rbac(...opsRoles), async (req, res) => 
     }
   }
 
+  // Staff Delivery Persons (with app login) become assignable partners automatically.
+  try {
+    await syncRestaurantDeliveryStaffPartners(pool, restaurantId);
+  } catch (err) {
+    console.error("[delivery-partners] staff sync failed:", err.message);
+  }
+
   const [rows] = await pool.execute(
     `SELECT p.id, p.restaurant_id, p.employee_id, p.phone, p.address, p.aadhaar_number,
             p.aadhaar_front_url, p.aadhaar_back_url, p.profile_pic_url, p.is_active, p.created_at,
@@ -620,7 +586,7 @@ router.get("/delivery-partners", auth(), rbac(...opsRoles), async (req, res) => 
      JOIN users u ON u.id = p.user_id
      JOIN restaurants r ON r.id = p.restaurant_id
      WHERE p.restaurant_id = ?
-     ORDER BY p.created_at DESC`,
+     ORDER BY p.is_active DESC, p.created_at DESC`,
     [restaurantId]
   );
   return res.json(rows);

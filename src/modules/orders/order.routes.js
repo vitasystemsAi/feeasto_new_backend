@@ -2040,12 +2040,9 @@ function orderRouter(io) {
     if (!order) return res.status(404).json({ message: "Order not found." });
 
     if (!canCustomerCancelOrder(order)) {
-      const status = String(order.status || "").toUpperCase();
-      const message =
-        status === "PLACED"
-          ? "This order can no longer be cancelled."
-          : "This order can no longer be cancelled. After the restaurant accepts, you have 8 minutes to cancel.";
-      return res.status(400).json({ message });
+      return res.status(400).json({
+        message: "This order can no longer be cancelled. Cancel is only available before the restaurant accepts.",
+      });
     }
 
     await ensureCancelledByColumn();

@@ -83,6 +83,49 @@ function normalizeSlotTime(t) {
   return `${String(Number(m[1])).padStart(2, "0")}:${m[2]}`;
 }
 
+function incrementLetterSeries(series) {
+  let a = series.charCodeAt(0);
+  let b = series.charCodeAt(1);
+  if (b < 90) return String.fromCharCode(a) + String.fromCharCode(b + 1);
+  if (a < 90) return String.fromCharCode(a + 1) + "A";
+  return "AA";
+}
+
+async function allocateEmployeeId(conn, restaurantId) {
+  const [existing] = await conn.execute(
+    "SELECT letter_series, next_number FROM partner_employee_id_counters WHERE restaurant_id = ? FOR UPDATE",
+    [restaurantId]
+  );
+
+  let letterSeries = "AA";
+  let nextNumber = 1;
+
+  if (existing[0]) {
+    letterSeries = existing[0].letter_series;
+    nextNumber = Number(existing[0].next_number);
+  } else {
+    await conn.execute(
+      "INSERT INTO partner_employee_id_counters (restaurant_id, letter_series, next_number) VALUES (?, 'AA', 1)",
+      [restaurantId]
+    );
+  }
+
+  const employeeId = `FAR-R${restaurantId}-${letterSeries}-${String(nextNumber).padStart(4, "0")}`;
+  let updatedSeries = letterSeries;
+  let updatedNumber = nextNumber + 1;
+  if (updatedNumber > 9999) {
+    updatedNumber = 1;
+    updatedSeries = incrementLetterSeries(letterSeries);
+  }
+
+  await conn.execute(
+    "UPDATE partner_employee_id_counters SET letter_series = ?, next_number = ? WHERE restaurant_id = ?",
+    [updatedSeries, updatedNumber, restaurantId]
+  );
+
+  return employeeId;
+}
+
 async function ensureDeliveryPartnerRow(conn, tenantId, userId) {
   const [existing] = await conn.execute(
     "SELECT id FROM delivery_partners WHERE tenant_id = ? AND user_id = ? LIMIT 1",
@@ -94,6 +137,123 @@ async function ensureDeliveryPartnerRow(conn, tenantId, userId) {
     [tenantId, userId]
   );
   return result.insertId;
+}
+
+/**
+ * Ensure a restaurant assignable-partner profile exists for a staff Delivery Person
+ * (or any delivery user with login). Required fields use staff placeholders when
+ * KYC docs were not collected via Subscriptions → Delivery Partners.
+ */
+async function ensureRestaurantDeliveryPartnerProfile(
+  conn,
+  { tenantId, restaurantId, userId, phone = null, isActive = true }
+) {
+  if (!tenantId || !restaurantId || !userId) return null;
+
+  const [[existing]] = await conn.execute(
+    `SELECT id, delivery_partner_id, is_active
+     FROM restaurant_delivery_partner_profiles
+     WHERE restaurant_id = ? AND user_id = ?
+     LIMIT 1`,
+    [restaurantId, userId]
+  );
+
+  const deliveryPartnerId = await ensureDeliveryPartnerRow(conn, tenantId, userId);
+
+  if (existing) {
+    const fields = ["delivery_partner_id = ?"];
+    const values = [deliveryPartnerId];
+    if (phone) {
+      fields.push("phone = COALESCE(NULLIF(phone, ''), ?)");
+      values.push(phone);
+    }
+    fields.push("is_active = ?");
+    values.push(isActive ? 1 : 0);
+    values.push(existing.id);
+    await conn.execute(
+      `UPDATE restaurant_delivery_partner_profiles SET ${fields.join(", ")} WHERE id = ?`,
+      values
+    );
+    return existing.id;
+  }
+
+  const employeeId = await allocateEmployeeId(conn, restaurantId);
+  const placeholderAadhaar = `9${String(userId).padStart(11, "0")}`.slice(0, 12);
+  const [result] = await conn.execute(
+    `INSERT INTO restaurant_delivery_partner_profiles
+      (tenant_id, restaurant_id, user_id, delivery_partner_id, employee_id, phone, address,
+       aadhaar_number, aadhaar_front_url, aadhaar_back_url, profile_pic_url, is_active)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+    [
+      tenantId,
+      restaurantId,
+      userId,
+      deliveryPartnerId,
+      employeeId,
+      phone || null,
+      "Registered via Staff (Delivery Person)",
+      placeholderAadhaar,
+      "staff://not-provided",
+      "staff://not-provided",
+      isActive ? 1 : 0,
+    ]
+  );
+  return result.insertId;
+}
+
+/**
+ * Sync Staff → Delivery Person accounts into restaurant_delivery_partner_profiles
+ * so owners can Assign-to-partner from Orders without re-registering under Subscriptions.
+ */
+async function syncRestaurantDeliveryStaffPartners(connOrPool, restaurantId) {
+  const rid = Number(restaurantId);
+  if (!rid) return { synced: 0 };
+
+  const run = async (conn) => {
+    const [staffRows] = await conn.execute(
+      `SELECT rs.id, rs.tenant_id, rs.restaurant_id, rs.user_id, rs.phone, rs.is_active
+       FROM restaurant_staff rs
+       INNER JOIN users u ON u.id = rs.user_id
+       WHERE rs.restaurant_id = ?
+         AND rs.staff_role = 'DELIVERY_PERSON'
+         AND rs.user_id IS NOT NULL
+         AND rs.has_app_login = 1
+         AND u.role = 'DELIVERY_PARTNER'`,
+      [rid]
+    );
+
+    let synced = 0;
+    for (const row of staffRows) {
+      if (!row.tenant_id) continue;
+      await ensureRestaurantDeliveryPartnerProfile(conn, {
+        tenantId: Number(row.tenant_id),
+        restaurantId: Number(row.restaurant_id),
+        userId: Number(row.user_id),
+        phone: row.phone,
+        isActive: Boolean(row.is_active),
+      });
+      synced += 1;
+    }
+    return { synced };
+  };
+
+  // Prefer an explicit transaction when caller passed a pool (FOR UPDATE on employee ids).
+  if (typeof connOrPool.getConnection === "function") {
+    const conn = await connOrPool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const result = await run(conn);
+      await conn.commit();
+      return result;
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
+  return run(connOrPool);
 }
 
 async function ensureProfileDeliveryPartnerId(conn, tenantId, profileId) {
@@ -356,7 +516,10 @@ async function syncPartnerSubscriberDeliveries(conn, tenantId, partnerId, isoDat
 
 module.exports = {
   isDeliveryScheduledForDate,
+  allocateEmployeeId,
   ensureDeliveryPartnerRow,
+  ensureRestaurantDeliveryPartnerProfile,
+  syncRestaurantDeliveryStaffPartners,
   ensureProfileDeliveryPartnerId,
   getPartnerIdForUser,
   resolvePartnerIdForSubscriber,

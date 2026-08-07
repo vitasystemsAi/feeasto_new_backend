@@ -152,7 +152,7 @@ function getOwnerOrderStatusLabel(orderStatus) {
   return map[o] || o;
 }
 
-const CUSTOMER_CANCEL_WINDOW_MS = 8 * 60 * 1000;
+const CUSTOMER_CANCEL_WINDOW_MS = 0;
 
 function getOwnerNextActions(orderStatus, orderType, options = {}) {
   const type = String(orderType || "").toUpperCase();
@@ -174,26 +174,16 @@ function getOwnerNextActions(orderStatus, orderType, options = {}) {
 }
 
 /**
- * Customer cancel: freely while PLACED (awaiting restaurant accept).
- * After accept, 8-minute window from accepted_at.
+ * Customer cancel: only while PLACED (awaiting restaurant accept).
+ * Once the restaurant accepts, cancel is no longer allowed.
  */
 function canCustomerCancelOrder(order) {
   const status = String(order?.status || "").toUpperCase();
-  if (status === "CANCELLED" || status === "DELIVERED") return false;
-  if (status === "PLACED") return true;
-
-  const acceptedAt = order?.accepted_at ? new Date(order.accepted_at) : null;
-  if (!acceptedAt || Number.isNaN(acceptedAt.getTime())) return false;
-  return Date.now() - acceptedAt.getTime() < CUSTOMER_CANCEL_WINDOW_MS;
+  return status === "PLACED";
 }
 
-function customerCancelDeadlineIso(order) {
-  const status = String(order?.status || "").toUpperCase();
-  if (status === "PLACED") return null;
-
-  const acceptedAt = order?.accepted_at ? new Date(order.accepted_at) : null;
-  if (!acceptedAt || Number.isNaN(acceptedAt.getTime())) return null;
-  return new Date(acceptedAt.getTime() + CUSTOMER_CANCEL_WINDOW_MS).toISOString();
+function customerCancelDeadlineIso(_order) {
+  return null;
 }
 
 function buildStatusPayload(orderStatus, deliveryStatus, cancelledBy, cancellationReason, extras = {}) {

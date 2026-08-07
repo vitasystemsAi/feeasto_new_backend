@@ -4,6 +4,9 @@ const { z } = require("zod");
 const pool = require("../../db/pool");
 const auth = require("../../middlewares/auth");
 const rbac = require("../../middlewares/rbac");
+const {
+  ensureRestaurantDeliveryPartnerProfile,
+} = require("../delivery/partner.service");
 
 const router = express.Router();
 
@@ -107,6 +110,17 @@ function mapStaffRow(row) {
 
 function loginRoleForStaffRole(staffRole) {
   return STAFF_ROLE_META[staffRole]?.loginRole || "MANAGER";
+}
+
+async function syncDeliveryPersonPartner(conn, { tenantId, restaurantId, userId, phone, isActive = true, staffRole }) {
+  if (String(staffRole) !== "DELIVERY_PERSON" || !userId || !tenantId) return null;
+  return ensureRestaurantDeliveryPartnerProfile(conn, {
+    tenantId: Number(tenantId),
+    restaurantId: Number(restaurantId),
+    userId: Number(userId),
+    phone: phone || null,
+    isActive,
+  });
 }
 
 router.get("/roles", auth(), rbac("OWNER", "MANAGER"), (_req, res) => {
@@ -238,6 +252,17 @@ router.post("/", auth(), rbac("OWNER"), async (req, res) => {
       ]
     );
 
+    if (userId && parsed.data.staffRole === "DELIVERY_PERSON") {
+      await syncDeliveryPersonPartner(conn, {
+        tenantId: ctx.tenantId,
+        restaurantId: parsed.data.restaurantId,
+        userId,
+        phone,
+        isActive: true,
+        staffRole: parsed.data.staffRole,
+      });
+    }
+
     await conn.commit();
 
     const [[row]] = await pool.execute(
@@ -306,6 +331,38 @@ router.patch("/:staffId", auth(), rbac("OWNER"), async (req, res) => {
   }
   if (existing.user_id && parsed.data.isActive !== undefined) {
     await pool.execute("UPDATE users SET is_active = ? WHERE id = ?", [parsed.data.isActive ? 1 : 0, existing.user_id]);
+  }
+
+  const nextRole = parsed.data.staffRole || existing.staff_role;
+  const nextActive = parsed.data.isActive !== undefined ? parsed.data.isActive : Boolean(existing.is_active);
+  if (existing.user_id && (nextRole === "DELIVERY_PERSON" || existing.staff_role === "DELIVERY_PERSON")) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      if (nextRole === "DELIVERY_PERSON" && nextActive) {
+        await syncDeliveryPersonPartner(conn, {
+          tenantId: ctx.tenantId,
+          restaurantId: existing.restaurant_id,
+          userId: existing.user_id,
+          phone: parsed.data.phone !== undefined ? String(parsed.data.phone || "").trim() || null : existing.phone,
+          isActive: true,
+          staffRole: "DELIVERY_PERSON",
+        });
+      } else if (existing.staff_role === "DELIVERY_PERSON") {
+        await conn.execute(
+          `UPDATE restaurant_delivery_partner_profiles
+           SET is_active = 0
+           WHERE restaurant_id = ? AND user_id = ?`,
+          [existing.restaurant_id, existing.user_id]
+        );
+      }
+      await conn.commit();
+    } catch (err) {
+      await conn.rollback();
+      console.error("[staff] delivery partner sync failed:", err.message);
+    } finally {
+      conn.release();
+    }
   }
 
   const [[row]] = await pool.execute(
@@ -378,6 +435,18 @@ router.post("/:staffId/enable-login", auth(), rbac("OWNER"), async (req, res) =>
       "UPDATE restaurant_staff SET user_id = ?, email = ?, has_app_login = 1 WHERE id = ?",
       [userCreated.insertId, email, staffId]
     );
+
+    if (existing.staff_role === "DELIVERY_PERSON") {
+      await syncDeliveryPersonPartner(conn, {
+        tenantId: ctx.tenantId,
+        restaurantId: existing.restaurant_id,
+        userId: userCreated.insertId,
+        phone: existing.phone,
+        isActive: Boolean(existing.is_active),
+        staffRole: existing.staff_role,
+      });
+    }
+
     await conn.commit();
     return res.json({ ok: true, userId: userCreated.insertId });
   } catch (error) {
@@ -402,6 +471,12 @@ router.delete("/:staffId", auth(), rbac("OWNER"), async (req, res) => {
   await pool.execute("UPDATE restaurant_staff SET is_active = 0 WHERE id = ?", [staffId]);
   if (existing.user_id) {
     await pool.execute("UPDATE users SET is_active = 0 WHERE id = ?", [existing.user_id]);
+    await pool.execute(
+      `UPDATE restaurant_delivery_partner_profiles
+       SET is_active = 0
+       WHERE restaurant_id = ? AND user_id = ?`,
+      [existing.restaurant_id, existing.user_id]
+    );
   }
 
   return res.json({ ok: true, message: "Staff member deactivated." });

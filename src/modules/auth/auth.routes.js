@@ -7,7 +7,7 @@ const pool = require("../../db/pool");
 const env = require("../../config/env");
 const auth = require("../../middlewares/auth");
 const rbac = require("../../middlewares/rbac");
-const { sendRegistrationOtpEmail } = require("../../services/mailer");
+const { sendRegistrationOtpEmail, smtpConfigured } = require("../../services/mailer");
 const { sendPasswordResetOtpSms } = require("../../services/sms");
 const { ensurePasswordResetSchema } = require("../../utils/ensurePasswordResetSchema");
 const {
@@ -224,35 +224,60 @@ router.post("/register/request-otp", async (req, res) => {
       );
     }
 
-    setImmediate(() => {
-      (async () => {
-        await Promise.allSettled([
-          sendRegistrationOtpEmail({
-            to: email,
-            otp,
-            fullName,
-            expiresInMinutes: env.otpTtlMinutes,
-          }).catch((emailErr) => {
-            // eslint-disable-next-line no-console
-            console.error("[register-otp] email failed:", emailErr.message);
-            if (env.nodeEnv !== "production") {
-              // eslint-disable-next-line no-console
-              console.log(`[register-otp-dev] OTP for ${email}: ${otp}`);
-            }
-          }),
-          sendPasswordResetOtpSms({ to: phone, otp, expiresMinutes: env.otpTtlMinutes }).then((smsResult) => {
-            if (!smsResult.sent) {
-              // eslint-disable-next-line no-console
-              console.warn("[register-otp] SMS not delivered:", smsResult.reason, smsResult.details || "");
-            }
-          }),
-        ]);
-      })();
-    });
+    let emailSent = false;
+    let emailError = null;
+    let smsResult = { sent: false, reason: "not_attempted" };
 
+    try {
+      await sendRegistrationOtpEmail({
+        to: email,
+        otp,
+        fullName,
+        expiresInMinutes: env.otpTtlMinutes,
+      });
+      emailSent = true;
+    } catch (emailErr) {
+      emailError = emailErr.message;
+      // eslint-disable-next-line no-console
+      console.error("[register-otp] email failed:", emailError);
+      if (env.nodeEnv !== "production") {
+        // eslint-disable-next-line no-console
+        console.log(`[register-otp-dev] OTP for ${email}: ${otp}`);
+      }
+    }
+
+    try {
+      smsResult = await sendPasswordResetOtpSms({
+        to: phone,
+        otp,
+        expiresMinutes: env.otpTtlMinutes,
+      });
+      if (!smsResult.sent) {
+        // eslint-disable-next-line no-console
+        console.warn("[register-otp] SMS not delivered:", smsResult.reason, smsResult.details || "");
+      }
+    } catch (smsErr) {
+      smsResult = { sent: false, reason: "sms_error", details: smsErr.message };
+      // eslint-disable-next-line no-console
+      console.error("[register-otp] SMS failed:", smsErr.message);
+    }
+
+    if (!emailSent && !smsResult.sent) {
+      return res.status(503).json({
+        message:
+          "Could not deliver OTP by email or SMS. Configure SMTP (SMTP_USER, SMTP_PASS, SMTP_FROM_EMAIL) and/or TWOFACTOR_API_KEY on the server, then try again.",
+        details: {
+          email: emailError || (!smtpConfigured() ? "smtp_not_configured" : "email_failed"),
+          sms: smsResult.reason || "sms_failed",
+        },
+      });
+    }
+
+    const channels = [emailSent ? "email" : null, smsResult.sent ? "mobile" : null].filter(Boolean);
     return res.status(200).json({
-      message: "Verification code sent to your email and mobile. Enter it to complete registration.",
+      message: `Verification code sent to your ${channels.join(" and ")}. Enter it to complete registration.`,
       expiresInMinutes: env.otpTtlMinutes,
+      deliveredVia: channels,
     });
   } catch (error) {
     return res.status(500).json({

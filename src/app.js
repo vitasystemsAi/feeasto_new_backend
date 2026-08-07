@@ -37,6 +37,14 @@ function isAllowedOrigin(origin) {
 function createApp(io) {
   const app = express();
 
+  // Behind nginx / ALB / Cloudflare, clients send X-Forwarded-For.
+  // Required so express-rate-limit does not throw ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+  // (that crash was blocking OTP and other API routes in production).
+  const trustProxyHops = Number(process.env.TRUST_PROXY ?? 1);
+  if (trustProxyHops > 0) {
+    app.set("trust proxy", trustProxyHops);
+  }
+
   app.use(
     helmet({
       // Allow frontend app (different origin/port) to display uploaded files.

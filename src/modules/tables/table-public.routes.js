@@ -92,16 +92,33 @@ function tablePublicRoutes(io) {
 
       const items = (menuRows || [])
         .filter((it) => Number(it.is_available) !== 0)
-        .map((it) => ({
-          id: it.id,
-          category_id: it.category_id,
-          category_name: it.category_name,
-          name: it.name,
-          description: it.description,
-          price: Number(it.price),
-          is_veg: Boolean(it.is_veg),
-          available_stock: it.available_stock,
-        }));
+        .map((it) => {
+          let descriptionText = "";
+          let imageUrl = null;
+          try {
+            const parsed = typeof it.description === "string" ? JSON.parse(it.description) : null;
+            if (parsed && typeof parsed === "object") {
+              descriptionText = String(parsed.text || parsed.notes || "").trim();
+              imageUrl = String(parsed.imageUrl || parsed.image || "").trim() || null;
+            } else if (it.description) {
+              descriptionText = String(it.description).trim();
+            }
+          } catch {
+            descriptionText = String(it.description || "").trim();
+          }
+          return {
+            id: it.id,
+            category_id: it.category_id,
+            category_name: it.category_name,
+            name: it.name,
+            description: it.description,
+            description_text: descriptionText || null,
+            image_url: imageUrl,
+            price: Number(it.price),
+            is_veg: Boolean(it.is_veg),
+            available_stock: it.available_stock,
+          };
+        });
 
       const categoriesMap = new Map();
       for (const it of items) {

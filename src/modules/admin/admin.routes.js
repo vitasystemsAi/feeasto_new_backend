@@ -8,6 +8,7 @@ const auth = require("../../middlewares/auth");
 const rbac = require("../../middlewares/rbac");
 const { platformApprover } = require("../../middlewares/platformApprover");
 const { VENDOR_TYPES, VENDOR_TYPE_KEYS, getVendorTypeLabel, getVendorTypeConfig } = require("../../config/vendorTypes");
+const { normalizeIndianPhone } = require("../../utils/phone");
 
 const router = express.Router();
 
@@ -15,6 +16,7 @@ const userCreateSchema = z.object({
   fullName: z.string().min(2),
   email: z.string().email(),
   password: z.string().min(8),
+  phone: z.string().min(7).max(20).optional().or(z.literal("")),
   role: z.enum(["CUSTOMER", "OWNER", "MANAGER", "DELIVERY_PARTNER", "ADMIN", "SUPER_ADMIN"]),
   tenantId: z.number().int().nullable().optional(),
   isActive: z.boolean().optional(),
@@ -23,6 +25,7 @@ const userCreateSchema = z.object({
 const userUpdateSchema = z.object({
   fullName: z.string().min(2).optional(),
   email: z.string().email().optional(),
+  phone: z.string().min(7).max(20).optional().or(z.literal("")).nullable(),
   role: z.enum(["CUSTOMER", "OWNER", "MANAGER", "DELIVERY_PARTNER", "ADMIN", "SUPER_ADMIN"]).optional(),
   tenantId: z.number().int().nullable().optional(),
   isActive: z.boolean().optional(),
@@ -194,7 +197,7 @@ router.get("/super/users", auth(), rbac("ADMIN", "SUPER_ADMIN"), async (req, res
   }
   const where = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
   const [rows] = await pool.execute(
-    `SELECT u.id, u.full_name, u.email, u.role, u.tenant_id, u.is_active, u.created_at,
+    `SELECT u.id, u.full_name, u.email, u.phone, u.role, u.tenant_id, u.is_active, u.created_at,
             t.name AS tenant_name
      FROM users u
      LEFT JOIN tenants t ON t.id = u.tenant_id
@@ -212,14 +215,33 @@ router.post("/super/users", auth(), rbac("ADMIN", "SUPER_ADMIN"), async (req, re
   if (forbidAdminManagingSuperAdmin(req, role)) {
     return res.status(403).json({ message: "Admins cannot create super admin users." });
   }
+  const rawPhone = String(parsed.data.phone || "").trim();
+  const phone = rawPhone ? normalizeIndianPhone(rawPhone) || rawPhone : null;
+  if (rawPhone && !normalizeIndianPhone(rawPhone)) {
+    return res.status(400).json({ message: "Enter a valid 10-digit Indian mobile number." });
+  }
   const hash = await bcrypt.hash(password, 10);
   try {
     const [result] = await pool.execute(
-      "INSERT INTO users (full_name, email, password_hash, role, tenant_id, is_active) VALUES (?, ?, ?, ?, ?, ?)",
-      [fullName, email.toLowerCase(), hash, role, tenantId, isActive ? 1 : 0]
+      "INSERT INTO users (full_name, email, phone, password_hash, role, tenant_id, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [fullName, email.toLowerCase(), phone, hash, role, tenantId, isActive ? 1 : 0]
     );
     return res.status(201).json({ id: Number(result.insertId), message: "User created" });
   } catch (error) {
+    if (error?.code === "ER_BAD_FIELD_ERROR") {
+      try {
+        const [result] = await pool.execute(
+          "INSERT INTO users (full_name, email, password_hash, role, tenant_id, is_active) VALUES (?, ?, ?, ?, ?, ?)",
+          [fullName, email.toLowerCase(), hash, role, tenantId, isActive ? 1 : 0]
+        );
+        return res.status(201).json({ id: Number(result.insertId), message: "User created" });
+      } catch (fallbackError) {
+        if (fallbackError?.code === "ER_DUP_ENTRY") {
+          return res.status(409).json({ message: "Email already exists." });
+        }
+        return res.status(500).json({ message: "Failed to create user.", details: fallbackError.message });
+      }
+    }
     if (error?.code === "ER_DUP_ENTRY") {
       return res.status(409).json({ message: "Email already exists." });
     }
@@ -246,6 +268,15 @@ router.patch("/super/users/:userId", auth(), rbac("ADMIN", "SUPER_ADMIN"), async
   if (parsed.data.email !== undefined) {
     updates.push("email = ?");
     values.push(parsed.data.email.toLowerCase());
+  }
+  if (parsed.data.phone !== undefined) {
+    const rawPhone = String(parsed.data.phone || "").trim();
+    const phone = rawPhone ? normalizeIndianPhone(rawPhone) || rawPhone : null;
+    if (rawPhone && !normalizeIndianPhone(rawPhone)) {
+      return res.status(400).json({ message: "Enter a valid 10-digit Indian mobile number." });
+    }
+    updates.push("phone = ?");
+    values.push(phone);
   }
   if (parsed.data.role !== undefined) {
     updates.push("role = ?");

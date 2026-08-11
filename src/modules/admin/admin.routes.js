@@ -12,11 +12,20 @@ const { normalizeIndianPhone } = require("../../utils/phone");
 
 const router = express.Router();
 
+const optionalPhone = z
+  .union([z.string(), z.number()])
+  .optional()
+  .nullable()
+  .transform((v) => {
+    if (v == null || v === "") return undefined;
+    return String(v).trim();
+  });
+
 const userCreateSchema = z.object({
   fullName: z.string().min(2),
   email: z.string().email(),
   password: z.string().min(8),
-  phone: z.string().min(7).max(20).optional().or(z.literal("")),
+  phone: optionalPhone,
   role: z.enum(["CUSTOMER", "OWNER", "MANAGER", "DELIVERY_PARTNER", "ADMIN", "SUPER_ADMIN"]),
   tenantId: z.number().int().nullable().optional(),
   isActive: z.boolean().optional(),
@@ -25,7 +34,7 @@ const userCreateSchema = z.object({
 const userUpdateSchema = z.object({
   fullName: z.string().min(2).optional(),
   email: z.string().email().optional(),
-  phone: z.string().min(7).max(20).optional().or(z.literal("")).nullable(),
+  phone: optionalPhone,
   role: z.enum(["CUSTOMER", "OWNER", "MANAGER", "DELIVERY_PARTNER", "ADMIN", "SUPER_ADMIN"]).optional(),
   tenantId: z.number().int().nullable().optional(),
   isActive: z.boolean().optional(),
@@ -210,15 +219,25 @@ router.get("/super/users", auth(), rbac("ADMIN", "SUPER_ADMIN"), async (req, res
 
 router.post("/super/users", auth(), rbac("ADMIN", "SUPER_ADMIN"), async (req, res) => {
   const parsed = userCreateSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ errors: parsed.error.issues });
+  if (!parsed.success) {
+    const message = parsed.error.issues
+      .map((issue) => `${issue.path?.[0] || "field"}: ${issue.message}`)
+      .join("; ");
+    return res.status(400).json({ message, errors: parsed.error.issues });
+  }
   const { fullName, email, password, role, tenantId = null, isActive = true } = parsed.data;
   if (forbidAdminManagingSuperAdmin(req, role)) {
     return res.status(403).json({ message: "Admins cannot create super admin users." });
   }
   const rawPhone = String(parsed.data.phone || "").trim();
-  const phone = rawPhone ? normalizeIndianPhone(rawPhone) || rawPhone : null;
-  if (rawPhone && !normalizeIndianPhone(rawPhone)) {
-    return res.status(400).json({ message: "Enter a valid 10-digit Indian mobile number." });
+  let phone = null;
+  if (rawPhone) {
+    phone = normalizeIndianPhone(rawPhone);
+    if (!phone) {
+      return res.status(400).json({
+        message: "Enter a valid 10-digit Indian mobile number (e.g. 9876543210).",
+      });
+    }
   }
   const hash = await bcrypt.hash(password, 10);
   try {

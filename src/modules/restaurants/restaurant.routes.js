@@ -25,7 +25,9 @@ const {
 } = require("../../utils/geo");
 const { parseStructuredAddressFromBody } = require("../../utils/structuredAddress");
 const { VENDOR_TYPE_KEYS, getVendorTypeLabel, getVendorTypeConfig } = require("../../config/vendorTypes");
+const { getDefaultMenuForVendorType } = require("../../config/defaultMenusByVendorType");
 const { ensureVendorTenant } = require("../../utils/restaurantTenant");
+const { seedDefaultMenuForRestaurant } = require("../../services/seedDefaultMenu");
 
 function resolveRestaurantAddressFromRequest(body) {
   const structured = parseStructuredAddressFromBody(body);
@@ -344,7 +346,24 @@ router.post(
       ]
     );
   }
-  return res.status(201).json({ id: result.insertId, message: "Vendor registration submitted for approval" });
+  const restaurantId = Number(result.insertId);
+  let menuSeed = null;
+  try {
+    menuSeed = await seedDefaultMenuForRestaurant(pool, {
+      restaurantId,
+      tenantId,
+      businessType,
+      onlyIfEmpty: true,
+    });
+  } catch {
+    menuSeed = { seeded: false, reason: "seed_failed" };
+  }
+
+  return res.status(201).json({
+    id: restaurantId,
+    message: "Vendor registration submitted for approval",
+    menuSeed,
+  });
 } catch (error) {
   if (error?.code === "ER_DUP_ENTRY") {
     return res.status(409).json({
@@ -370,7 +389,7 @@ router.patch("/:restaurantId/verification", auth(), rbac("ADMIN", "SUPER_ADMIN")
 
   const restaurantId = Number(req.params.restaurantId);
   const [[restaurant]] = await pool.execute(
-    "SELECT id, approval_status FROM restaurants WHERE id = ? LIMIT 1",
+    "SELECT id, approval_status, tenant_id, business_type FROM restaurants WHERE id = ? LIMIT 1",
     [restaurantId]
   );
   if (!restaurant) return res.status(404).json({ message: "Restaurant not found" });
@@ -392,11 +411,26 @@ router.patch("/:restaurantId/verification", auth(), rbac("ADMIN", "SUPER_ADMIN")
     ]
   );
 
+  let menuSeed = null;
+  if (parsed.data.decision === "APPROVED" && restaurant.tenant_id) {
+    try {
+      menuSeed = await seedDefaultMenuForRestaurant(pool, {
+        restaurantId,
+        tenantId: restaurant.tenant_id,
+        businessType: restaurant.business_type || "restaurant",
+        onlyIfEmpty: true,
+      });
+    } catch {
+      menuSeed = { seeded: false, reason: "seed_failed" };
+    }
+  }
+
   return res.json({
     message:
       parsed.data.decision === "APPROVED"
         ? "Restaurant approved successfully."
         : "Restaurant rejected successfully.",
+    menuSeed,
   });
 });
 
@@ -975,6 +1009,91 @@ router.get("/managed", auth(), rbac("OWNER", "MANAGER"), async (req, res) => {
 
   return res.json(items);
 });
+
+/** Preview starter categories/items for a vendor type (or the restaurant's type). */
+router.get(
+  "/menu/defaults",
+  auth(),
+  rbac("OWNER", "MANAGER", "ADMIN", "SUPER_ADMIN"),
+  async (req, res) => {
+    let businessType = req.query.businessType ? String(req.query.businessType) : null;
+    const restaurantId = req.query.restaurantId ? Number(req.query.restaurantId) : null;
+
+    if (!businessType && restaurantId) {
+      const [[row]] = await pool.execute(
+        "SELECT business_type FROM restaurants WHERE id = ? LIMIT 1",
+        [restaurantId]
+      );
+      businessType = row?.business_type || "restaurant";
+    }
+    businessType = businessType || "restaurant";
+    if (!VENDOR_TYPE_KEYS.includes(businessType)) {
+      return res.status(400).json({ message: "Invalid businessType" });
+    }
+
+    const menu = getDefaultMenuForVendorType(businessType);
+    return res.json({
+      businessType,
+      label: getVendorTypeLabel(businessType),
+      categories: menu.categories || [],
+    });
+  }
+);
+
+/**
+ * Apply starter categories + items for this restaurant based on business_type.
+ * Body: { onlyIfEmpty?: boolean } — default true (won't overwrite existing menu).
+ * Pass onlyIfEmpty: false to merge missing category/item names only.
+ */
+router.post(
+  "/:restaurantId/menu/apply-defaults",
+  auth(),
+  tenantScope,
+  rbac("OWNER", "MANAGER"),
+  async (req, res) => {
+    const restaurantId = Number(req.params.restaurantId);
+    if (!Number.isFinite(restaurantId) || restaurantId <= 0) {
+      return res.status(400).json({ message: "Valid restaurantId is required" });
+    }
+
+    const onlyIfEmpty = req.body?.onlyIfEmpty !== false && req.body?.onlyIfEmpty !== "false";
+
+    const [[restaurant]] = await pool.execute(
+      "SELECT id, tenant_id, business_type FROM restaurants WHERE id = ? AND tenant_id = ? LIMIT 1",
+      [restaurantId, req.tenantId]
+    );
+    if (!restaurant) return res.status(404).json({ message: "Restaurant not found" });
+
+    try {
+      const result = await seedDefaultMenuForRestaurant(pool, {
+        restaurantId,
+        tenantId: req.tenantId,
+        businessType: restaurant.business_type || "restaurant",
+        onlyIfEmpty,
+      });
+      if (!result.seeded && result.reason === "already_has_menu") {
+        return res.status(409).json({
+          message:
+            "This shop already has categories. Pass onlyIfEmpty: false to add any missing starter names, or edit/delete existing ones.",
+          ...result,
+        });
+      }
+      return res.status(result.seeded ? 201 : 200).json({
+        message: result.seeded
+          ? `Added ${result.categoriesCreated} categories and ${result.itemsCreated} items. You can edit or delete them anytime.`
+          : result.reason === "nothing_new"
+            ? "Starter names already present — nothing new to add."
+            : "No starter menu applied.",
+        ...result,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        message: "Failed to apply starter menu.",
+        details: error?.message || "Unknown error",
+      });
+    }
+  }
+);
 
 router.post("/menu/categories", auth(), tenantScope, rbac("OWNER", "MANAGER"), async (req, res) => {
   const schema = z.object({ restaurantId: z.number().int(), name: z.string().min(2) });

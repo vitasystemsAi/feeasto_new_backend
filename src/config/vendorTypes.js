@@ -199,6 +199,8 @@ const VENDOR_TYPES = [
   },
 ];
 
+const { getDefaultMenuForVendorType } = require("./defaultMenusByVendorType");
+
 const VENDOR_TYPE_KEYS = VENDOR_TYPES.map((v) => v.key);
 
 function getVendorTypeLabel(key) {
@@ -211,4 +213,27 @@ function getVendorTypeConfig(key) {
   return found ? found.orderingConfig : VENDOR_TYPES[0].orderingConfig;
 }
 
-module.exports = { VENDOR_TYPES, VENDOR_TYPE_KEYS, getVendorTypeLabel, getVendorTypeConfig };
+/** Vendor types enriched with starter category/item templates for onboarding UI. */
+function getVendorTypesWithDefaultMenus() {
+  return VENDOR_TYPES.map((v) => {
+    const menu = getDefaultMenuForVendorType(v.key);
+    return {
+      ...v,
+      defaultMenu: {
+        categories: (menu.categories || []).map((c) => ({
+          name: c.name,
+          itemNames: (c.items || []).map((i) => i.name),
+          items: c.items || [],
+        })),
+      },
+    };
+  });
+}
+
+module.exports = {
+  VENDOR_TYPES,
+  VENDOR_TYPE_KEYS,
+  getVendorTypeLabel,
+  getVendorTypeConfig,
+  getVendorTypesWithDefaultMenus,
+};

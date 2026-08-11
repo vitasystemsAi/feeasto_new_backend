@@ -7,7 +7,14 @@ const pool = require("../../db/pool");
 const auth = require("../../middlewares/auth");
 const rbac = require("../../middlewares/rbac");
 const { platformApprover } = require("../../middlewares/platformApprover");
-const { VENDOR_TYPES, VENDOR_TYPE_KEYS, getVendorTypeLabel, getVendorTypeConfig } = require("../../config/vendorTypes");
+const {
+  VENDOR_TYPES,
+  VENDOR_TYPE_KEYS,
+  getVendorTypeLabel,
+  getVendorTypeConfig,
+  getVendorTypesWithDefaultMenus,
+} = require("../../config/vendorTypes");
+const { seedDefaultMenuForRestaurant } = require("../../services/seedDefaultMenu");
 const { normalizeIndianPhone } = require("../../utils/phone");
 const { ensureVendorTenant } = require("../../utils/restaurantTenant");
 
@@ -95,7 +102,7 @@ function forbidAdminManagingSuperAdmin(req, targetRole) {
 
 // Public vendor types catalog (includes orderingConfig) — no auth required for onboarding forms
 router.get("/vendor-types", (_req, res) => {
-  return res.json(VENDOR_TYPES);
+  return res.json(getVendorTypesWithDefaultMenus());
 });
 
 router.get("/overview", auth(), rbac("ADMIN", "SUPER_ADMIN"), async (_req, res) => {
@@ -414,10 +421,23 @@ router.post("/super/restaurants", auth(), rbac("ADMIN", "SUPER_ADMIN"), async (r
         [resolvedTenantId, ownerUserId, name, makeSlug(name), description, address, "{}", approvalStatus]
       );
     });
+    const restaurantId = Number(result.insertId);
+    let menuSeed = null;
+    try {
+      menuSeed = await seedDefaultMenuForRestaurant(pool, {
+        restaurantId,
+        tenantId: resolvedTenantId,
+        businessType,
+        onlyIfEmpty: true,
+      });
+    } catch {
+      menuSeed = { seeded: false, reason: "seed_failed" };
+    }
     return res.status(201).json({
-      id: Number(result.insertId),
+      id: restaurantId,
       tenantId: resolvedTenantId,
       message: "Vendor registered successfully",
+      menuSeed,
     });
   } catch (error) {
     return res.status(500).json({ message: "Failed to register vendor.", details: error.message });

@@ -865,32 +865,70 @@ router.get("/managed", auth(), rbac("OWNER", "MANAGER"), async (req, res) => {
   }
 
   await ensureIsOnlineColumn();
-  const [rows] =
-    req.user.role === "OWNER"
-      ? await pool.execute(
-          `SELECT id, name, slug, approval_status, kyc_document_url, tenant_id, is_online
-           FROM restaurants
-           WHERE owner_user_id = ? OR (? IS NOT NULL AND tenant_id = ?)
-           ORDER BY id DESC`,
-          [req.user.sub, resolvedTenantId, resolvedTenantId]
-        )
-      : await pool.execute(
-          `SELECT id, name, slug, approval_status, kyc_document_url, tenant_id, is_online
-           FROM restaurants
-           WHERE tenant_id = ?
-           ORDER BY id DESC`,
-          [resolvedTenantId]
-        );
+  let rows;
+  try {
+    [rows] =
+      req.user.role === "OWNER"
+        ? await pool.execute(
+            `SELECT id, name, slug, approval_status, kyc_document_url, tenant_id, is_online,
+                    COALESCE(business_type, 'restaurant') AS business_type,
+                    business_type_label, vendor_config
+             FROM restaurants
+             WHERE owner_user_id = ? OR (? IS NOT NULL AND tenant_id = ?)
+             ORDER BY id DESC`,
+            [req.user.sub, resolvedTenantId, resolvedTenantId]
+          )
+        : await pool.execute(
+            `SELECT id, name, slug, approval_status, kyc_document_url, tenant_id, is_online,
+                    COALESCE(business_type, 'restaurant') AS business_type,
+                    business_type_label, vendor_config
+             FROM restaurants
+             WHERE tenant_id = ?
+             ORDER BY id DESC`,
+            [resolvedTenantId]
+          );
+  } catch (error) {
+    if (error?.code !== "ER_BAD_FIELD_ERROR") throw error;
+    [rows] =
+      req.user.role === "OWNER"
+        ? await pool.execute(
+            `SELECT id, name, slug, approval_status, kyc_document_url, tenant_id, is_online
+             FROM restaurants
+             WHERE owner_user_id = ? OR (? IS NOT NULL AND tenant_id = ?)
+             ORDER BY id DESC`,
+            [req.user.sub, resolvedTenantId, resolvedTenantId]
+          )
+        : await pool.execute(
+            `SELECT id, name, slug, approval_status, kyc_document_url, tenant_id, is_online
+             FROM restaurants
+             WHERE tenant_id = ?
+             ORDER BY id DESC`,
+            [resolvedTenantId]
+          );
+  }
 
-  const items = (rows || []).map((r) => ({
-    id: Number(r.id),
-    name: r.name,
-    slug: r.slug,
-    approval_status: r.approval_status,
-    kyc_document_url: r.kyc_document_url ?? null,
-    tenant_id: r.tenant_id != null ? Number(r.tenant_id) : null,
-    is_online: r.is_online !== 0 && r.is_online !== false,
-  }));
+  const items = (rows || []).map((r) => {
+    let vendorConfig = r.vendor_config ?? null;
+    if (typeof vendorConfig === "string") {
+      try {
+        vendorConfig = JSON.parse(vendorConfig);
+      } catch {
+        vendorConfig = null;
+      }
+    }
+    return {
+      id: Number(r.id),
+      name: r.name,
+      slug: r.slug,
+      approval_status: r.approval_status,
+      kyc_document_url: r.kyc_document_url ?? null,
+      tenant_id: r.tenant_id != null ? Number(r.tenant_id) : null,
+      is_online: r.is_online !== 0 && r.is_online !== false,
+      business_type: r.business_type || "restaurant",
+      business_type_label: r.business_type_label || null,
+      vendor_config: vendorConfig,
+    };
+  });
   return res.json(items);
 });
 

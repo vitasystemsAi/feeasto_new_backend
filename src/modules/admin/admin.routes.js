@@ -7,6 +7,7 @@ const pool = require("../../db/pool");
 const auth = require("../../middlewares/auth");
 const rbac = require("../../middlewares/rbac");
 const { platformApprover } = require("../../middlewares/platformApprover");
+const { VENDOR_TYPES, VENDOR_TYPE_KEYS, getVendorTypeLabel, getVendorTypeConfig } = require("../../config/vendorTypes");
 
 const router = express.Router();
 
@@ -31,6 +32,15 @@ const userPasswordSchema = z.object({
   password: z.string().min(8),
 });
 
+const vendorConfigSchema = z.object({
+  orderingMode: z.string().optional(),
+  defaultUnit: z.string().optional(),
+  allowedUnits: z.array(z.string()).optional(),
+  portionOptions: z.array(z.string()).optional(),
+  orderFlow: z.array(z.string()).optional(),
+  unitLabel: z.string().optional(),
+}).passthrough().optional();
+
 const restaurantCreateSchema = z.object({
   name: z.string().min(2),
   address: z.string().min(5),
@@ -38,6 +48,8 @@ const restaurantCreateSchema = z.object({
   ownerUserId: z.number().int(),
   tenantId: z.number().int().nullable().optional(),
   approvalStatus: z.enum(["PENDING", "APPROVED", "REJECTED"]).optional(),
+  businessType: z.enum(VENDOR_TYPE_KEYS).optional(),
+  vendorConfig: vendorConfigSchema,
 });
 
 const restaurantUpdateSchema = z.object({
@@ -47,6 +59,8 @@ const restaurantUpdateSchema = z.object({
   ownerUserId: z.number().int().optional(),
   tenantId: z.number().int().nullable().optional(),
   approvalStatus: z.enum(["PENDING", "APPROVED", "REJECTED"]).optional(),
+  businessType: z.enum(VENDOR_TYPE_KEYS).optional(),
+  vendorConfig: vendorConfigSchema,
 });
 
 function makeSlug(value) {
@@ -66,27 +80,51 @@ function forbidAdminManagingSuperAdmin(req, targetRole) {
   return !isSuperAdmin(req) && String(targetRole || "").toUpperCase() === "SUPER_ADMIN";
 }
 
+// Public vendor types catalog (includes orderingConfig) — no auth required for onboarding forms
+router.get("/vendor-types", (_req, res) => {
+  return res.json(VENDOR_TYPES);
+});
+
 router.get("/overview", auth(), rbac("ADMIN", "SUPER_ADMIN"), async (_req, res) => {
   const [[restaurants]] = await pool.execute("SELECT COUNT(*) AS totalRestaurants FROM restaurants");
   const [[customers]] = await pool.execute("SELECT COUNT(*) AS totalCustomers FROM users WHERE role = 'CUSTOMER'");
   const [[owners]] = await pool.execute("SELECT COUNT(*) AS totalOwners FROM users WHERE role = 'OWNER'");
   const [[orders]] = await pool.execute("SELECT COUNT(*) AS totalOrders FROM orders");
+  const [vendorBreakdown] = await pool.execute(
+    "SELECT business_type, COUNT(*) AS cnt FROM restaurants GROUP BY business_type"
+  ).catch(() => [[]]); // graceful fallback if column not yet applied
 
   return res.json({
     totalRestaurants: Number(restaurants.totalRestaurants || 0),
     totalCustomers: Number(customers.totalCustomers || 0),
     totalOwners: Number(owners.totalOwners || 0),
     totalOrders: Number(orders.totalOrders || 0),
+    vendorBreakdown: (vendorBreakdown || []).map((row) => ({
+      businessType: row.business_type,
+      label: getVendorTypeLabel(row.business_type),
+      count: Number(row.cnt),
+    })),
   });
 });
 
-router.get("/restaurants", auth(), rbac("ADMIN", "SUPER_ADMIN"), platformApprover(), async (_req, res) => {
+router.get("/restaurants", auth(), rbac("ADMIN", "SUPER_ADMIN"), platformApprover(), async (req, res) => {
+  const businessType = req.query.businessType ? String(req.query.businessType) : null;
+  const params = [];
+  let whereClause = "";
+  if (businessType) {
+    whereClause = "WHERE r.business_type = ?";
+    params.push(businessType);
+  }
   const [rows] = await pool.execute(
     `SELECT r.id, r.name, r.slug, r.description, r.address, r.approval_status, r.rating, r.created_at, r.kyc_document_url,
+            COALESCE(r.business_type, 'restaurant') AS business_type,
+            r.business_type_label,
             u.full_name AS owner_name, u.email AS owner_email
      FROM restaurants r
      LEFT JOIN users u ON u.id = r.owner_user_id
-     ORDER BY r.id DESC`
+     ${whereClause}
+     ORDER BY r.id DESC`,
+    params
   );
   return res.json(rows);
 });
@@ -271,14 +309,25 @@ router.delete("/super/users/:userId", auth(), rbac("ADMIN", "SUPER_ADMIN"), asyn
   }
 });
 
-router.get("/super/restaurants", auth(), rbac("ADMIN", "SUPER_ADMIN"), async (_req, res) => {
+router.get("/super/restaurants", auth(), rbac("ADMIN", "SUPER_ADMIN"), async (req, res) => {
+  const businessType = req.query.businessType ? String(req.query.businessType) : null;
+  const params = [];
+  let whereClause = "";
+  if (businessType) {
+    whereClause = "WHERE r.business_type = ?";
+    params.push(businessType);
+  }
   const [rows] = await pool.execute(
     `SELECT r.id, r.name, r.slug, r.description, r.address, r.approval_status, r.tenant_id, r.owner_user_id, r.created_at,
+            COALESCE(r.business_type, 'restaurant') AS business_type,
+            r.business_type_label, r.vendor_config,
             t.name AS tenant_name, u.full_name AS owner_name, u.email AS owner_email
      FROM restaurants r
      LEFT JOIN tenants t ON t.id = r.tenant_id
      LEFT JOIN users u ON u.id = r.owner_user_id
-     ORDER BY r.id DESC`
+     ${whereClause}
+     ORDER BY r.id DESC`,
+    params
   );
   return res.json(rows);
 });
@@ -286,15 +335,24 @@ router.get("/super/restaurants", auth(), rbac("ADMIN", "SUPER_ADMIN"), async (_r
 router.post("/super/restaurants", auth(), rbac("ADMIN", "SUPER_ADMIN"), async (req, res) => {
   const parsed = restaurantCreateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ errors: parsed.error.issues });
-  const { name, address, description = "", ownerUserId, tenantId = null, approvalStatus = "PENDING" } = parsed.data;
+  const { name, address, description = "", ownerUserId, tenantId = null, approvalStatus = "PENDING", businessType = "restaurant", vendorConfig } = parsed.data;
+  const businessTypeLabel = getVendorTypeLabel(businessType);
+  // Merge supplied config with defaults from vendor type definition
+  const defaultConfig = getVendorTypeConfig(businessType);
+  const finalConfig = vendorConfig ? { ...defaultConfig, ...vendorConfig } : defaultConfig;
   try {
     const [result] = await pool.execute(
-      "INSERT INTO restaurants (tenant_id, owner_user_id, name, slug, description, address, kyc_document_url, approval_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      [tenantId, ownerUserId, name, makeSlug(name), description, address, "{}", approvalStatus]
-    );
-    return res.status(201).json({ id: Number(result.insertId), message: "Restaurant created" });
+      "INSERT INTO restaurants (tenant_id, owner_user_id, name, slug, description, address, kyc_document_url, approval_status, business_type, business_type_label, vendor_config) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [tenantId, ownerUserId, name, makeSlug(name), description, address, "{}", approvalStatus, businessType, businessTypeLabel, JSON.stringify(finalConfig)]
+    ).catch(async () => {
+      return pool.execute(
+        "INSERT INTO restaurants (tenant_id, owner_user_id, name, slug, description, address, kyc_document_url, approval_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [tenantId, ownerUserId, name, makeSlug(name), description, address, "{}", approvalStatus]
+      );
+    });
+    return res.status(201).json({ id: Number(result.insertId), message: "Vendor registered successfully" });
   } catch (error) {
-    return res.status(500).json({ message: "Failed to create restaurant.", details: error.message });
+    return res.status(500).json({ message: "Failed to register vendor.", details: error.message });
   }
 });
 
@@ -328,6 +386,21 @@ router.patch("/super/restaurants/:restaurantId", auth(), rbac("ADMIN", "SUPER_AD
   if (parsed.data.approvalStatus !== undefined) {
     updates.push("approval_status = ?");
     values.push(parsed.data.approvalStatus);
+  }
+  if (parsed.data.businessType !== undefined) {
+    updates.push("business_type = ?");
+    values.push(parsed.data.businessType);
+    updates.push("business_type_label = ?");
+    values.push(getVendorTypeLabel(parsed.data.businessType));
+    // Reset vendor_config to type defaults when type changes (unless explicit config supplied)
+    if (!parsed.data.vendorConfig) {
+      updates.push("vendor_config = ?");
+      values.push(JSON.stringify(getVendorTypeConfig(parsed.data.businessType)));
+    }
+  }
+  if (parsed.data.vendorConfig !== undefined) {
+    updates.push("vendor_config = ?");
+    values.push(JSON.stringify(parsed.data.vendorConfig));
   }
   if (!updates.length) return res.status(400).json({ message: "No fields to update." });
   values.push(restaurantId);

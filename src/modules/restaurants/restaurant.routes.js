@@ -24,6 +24,7 @@ const {
   evaluateCustomerRestaurantRadius,
 } = require("../../utils/geo");
 const { parseStructuredAddressFromBody } = require("../../utils/structuredAddress");
+const { VENDOR_TYPE_KEYS, getVendorTypeLabel, getVendorTypeConfig } = require("../../config/vendorTypes");
 
 function resolveRestaurantAddressFromRequest(body) {
   const structured = parseStructuredAddressFromBody(body);
@@ -232,6 +233,8 @@ router.post(
     tradeLicenseNumber: z.string().optional(),
     fssaiNumber: z.string().optional(),
     gstNumber: z.string().optional(),
+    businessType: z.enum(VENDOR_TYPE_KEYS).optional().default("restaurant"),
+    vendorConfig: z.string().optional(), // JSON string from FormData
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -267,7 +270,16 @@ router.post(
   };
   // In early-stage onboarding we allow missing compliance docs; admins can still reject on verification.
 
-  const { name, slug, description } = parsed.data;
+  const { name, slug, description, businessType = "restaurant" } = parsed.data;
+  const businessTypeLabel = getVendorTypeLabel(businessType);
+  // Parse vendor config: custom overrides merged over type defaults
+  let vendorConfigObj = getVendorTypeConfig(businessType);
+  if (parsed.data.vendorConfig) {
+    try {
+      const supplied = JSON.parse(parsed.data.vendorConfig);
+      vendorConfigObj = { ...vendorConfigObj, ...supplied };
+    } catch { /* ignore malformed JSON */ }
+  }
   const addrResolved = resolveRestaurantAddressFromRequest({ ...parsed.data, ...req.body });
   if (!addrResolved || addrResolved.ok === false) {
     return res.status(400).json({
@@ -283,8 +295,8 @@ router.post(
     [result] = await pool.execute(
       `INSERT INTO restaurants (tenant_id, name, slug, description, address,
        address_village, address_city, address_district, address_state, address_country, address_pincode,
-       latitude, longitude, owner_user_id, kyc_document_url, approval_status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
+       latitude, longitude, owner_user_id, kyc_document_url, approval_status, business_type, business_type_label, vendor_config)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)`,
       [
         req.user.tenantId ? Number(req.user.tenantId) : null,
         name,
@@ -301,10 +313,14 @@ router.post(
         lng,
         req.user.sub,
         JSON.stringify(compliancePayload),
+        businessType,
+        businessTypeLabel,
+        JSON.stringify(vendorConfigObj),
       ]
     );
   } catch (error) {
     if (error?.code !== "ER_BAD_FIELD_ERROR") throw error;
+    // Fallback: columns not yet applied
     [result] = await pool.execute(
       "INSERT INTO restaurants (tenant_id, name, slug, description, address, owner_user_id, kyc_document_url, approval_status) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')",
       [
@@ -318,7 +334,7 @@ router.post(
       ]
     );
   }
-  return res.status(201).json({ id: result.insertId, message: "Restaurant submitted for approval" });
+  return res.status(201).json({ id: result.insertId, message: "Vendor registration submitted for approval" });
 } catch (error) {
   if (error?.code === "ER_DUP_ENTRY") {
     return res.status(409).json({
@@ -378,17 +394,27 @@ router.get("/", auth(false), async (req, res) => {
   await ensureIsOnlineColumn();
   const customerLat = parseCoord(req.query.customerLat ?? req.query.lat);
   const customerLng = parseCoord(req.query.customerLng ?? req.query.lng);
+  const businessType = req.query.businessType ? String(req.query.businessType) : null;
+  const params = [];
+  let extraWhere = "";
+  if (businessType) {
+    extraWhere = "AND r.business_type = ?";
+    params.push(businessType);
+  }
   let rows;
   try {
     [rows] = await pool.execute(
       `SELECT r.id, r.name, r.slug, r.description, r.rating, r.approval_status, r.address,
               r.latitude, r.longitude, COALESCE(r.is_online, 1) AS is_online,
+              COALESCE(r.business_type, 'restaurant') AS business_type,
+              r.business_type_label, r.vendor_config,
               COALESCE(rp.priority_rank, 999) AS priority_rank
        FROM restaurants r
        LEFT JOIN restaurant_priorities rp
          ON rp.restaurant_id = r.id AND COALESCE(rp.is_active, 1) = 1
-       WHERE r.approval_status = 'APPROVED' AND r.is_active = 1
-       ORDER BY COALESCE(rp.priority_rank, 999), r.name`
+       WHERE r.approval_status = 'APPROVED' AND r.is_active = 1 ${extraWhere}
+       ORDER BY COALESCE(rp.priority_rank, 999), r.name`,
+      params
     );
   } catch (error) {
     if (error?.code !== "ER_BAD_FIELD_ERROR") throw error;
@@ -564,7 +590,8 @@ router.get("/my", auth(), rbac("OWNER"), async (req, res) => {
     [rows] = await pool.execute(
       `SELECT id, name, slug, description, rating, approval_status, kyc_document_url, is_online,
               address, address_village, address_city, address_district, address_state, address_country, address_pincode,
-              latitude, longitude
+              latitude, longitude,
+              COALESCE(business_type, 'restaurant') AS business_type, business_type_label, vendor_config
        FROM restaurants WHERE owner_user_id = ? ORDER BY id DESC`,
       [req.user.sub]
     );

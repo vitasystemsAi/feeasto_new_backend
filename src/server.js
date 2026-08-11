@@ -12,6 +12,7 @@ const { ensureUserProfileSchema } = require("./utils/ensureUserProfileSchema");
 const { ensureStaffSchema } = require("./modules/staff/ensureStaffSchema");
 const { ensureTableQrSchema } = require("./modules/tables/ensureTableQrSchema");
 const { ensureDeliveryHandoffSchema } = require("./modules/delivery/ensureDeliveryHandoffSchema");
+const { ensureVendorTypeSchema } = require("./utils/ensureVendorTypeSchema");
 const { startTrendingSyncJob } = require("./modules/portal/services/trendingSync");
 const { startOwnerAcceptTimeoutJob } = require("./services/ownerAcceptTimeout");
 const { warmSmtpConnection } = require("./services/mailer");
@@ -138,6 +139,7 @@ async function startServer() {
     await ensureStaffSchema();
     await ensureTableQrSchema();
     await ensureDeliveryHandoffSchema();
+    await ensureVendorTypeSchema();
     setImmediate(() => {
       warmSmtpConnection().catch(() => {});
     });

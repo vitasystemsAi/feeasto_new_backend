@@ -587,6 +587,25 @@ router.post("/login", async (req, res) => {
       if (!ca) return res.status(401).json({ message: "Customer admin account is inactive" });
     }
 
+    // Auto-link tenant for shop owners created without tenant_id
+    if (user.role === "OWNER" && (user.tenant_id == null || user.tenant_id === "")) {
+      try {
+        const { ensureVendorTenant } = require("../../utils/restaurantTenant");
+        const [[shop]] = await pool.execute(
+          "SELECT id, name FROM restaurants WHERE owner_user_id = ? ORDER BY id DESC LIMIT 1",
+          [user.id]
+        );
+        const tenantId = await ensureVendorTenant(pool, {
+          restaurantId: shop?.id || null,
+          ownerUserId: user.id,
+          businessName: shop?.name || user.full_name || "Owner shop",
+        });
+        user.tenant_id = tenantId;
+      } catch {
+        // continue login even if tenant heal fails
+      }
+    }
+
     const payload = { sub: Number(user.id), role: user.role, tenantId: user.tenant_id ? Number(user.tenant_id) : null, email: user.email };
     const accessToken = jwt.sign(payload, env.jwtSecret, { expiresIn: env.jwtExpiresIn });
     const refreshToken = jwt.sign(payload, env.jwtRefreshSecret, { expiresIn: env.jwtRefreshExpiresIn });
@@ -629,6 +648,23 @@ router.post("/refresh", async (req, res) => {
     );
     const user = rows[0];
     if (!user) return res.status(401).json({ message: "Invalid refresh token" });
+
+    if (user.role === "OWNER" && (user.tenant_id == null || user.tenant_id === "")) {
+      try {
+        const { ensureVendorTenant } = require("../../utils/restaurantTenant");
+        const [[shop]] = await pool.execute(
+          "SELECT id, name FROM restaurants WHERE owner_user_id = ? ORDER BY id DESC LIMIT 1",
+          [user.id]
+        );
+        user.tenant_id = await ensureVendorTenant(pool, {
+          restaurantId: shop?.id || null,
+          ownerUserId: user.id,
+          businessName: shop?.name || user.full_name || "Owner shop",
+        });
+      } catch {
+        // ignore
+      }
+    }
     if (user.password_updated_at) {
       const pwdAt = new Date(user.password_updated_at).getTime();
       const issuedAt = (decoded.iat || 0) * 1000;

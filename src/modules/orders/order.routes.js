@@ -518,7 +518,17 @@ function orderRouter(io) {
     const schema = z.object({
       restaurantId: z.coerce.number().int().positive(),
       items: z
-        .array(z.object({ menuItemId: z.coerce.number().int().positive(), quantity: z.coerce.number().int().positive() }))
+        .array(
+          z.object({
+            menuItemId: z.coerce.number().int().positive(),
+            quantity: z.coerce.number().int().positive(),
+            unitPrice: z.coerce.number().positive().optional(),
+            selectedUnit: z.string().max(40).optional(),
+            portion: z.string().max(40).optional(),
+            itemUnit: z.string().max(40).optional(),
+            unitNote: z.string().max(80).optional(),
+          })
+        )
         .min(1),
     });
     const parsed = schema.safeParse(req.body);
@@ -550,11 +560,21 @@ function orderRouter(io) {
         }
       }
 
-      for (const item of parsed.data.items) {
-        await conn.execute(
-          "INSERT INTO order_items (order_id, menu_item_id, quantity, unit_price) SELECT ?, id, ?, price FROM menu_items WHERE id = ?",
-          [orderId, item.quantity, item.menuItemId]
-        );
+      const resolved = await computeCustomerCartTotal(conn, parsed.data.restaurantId, parsed.data.items);
+      for (const line of resolved.lines) {
+        try {
+          await conn.execute(
+            `INSERT INTO order_items (order_id, menu_item_id, quantity, unit_price, customization_json)
+             VALUES (?, ?, ?, ?, ?)`,
+            [orderId, line.menuItemId, line.quantity, line.unitPrice, line.customizationJson]
+          );
+        } catch (error) {
+          if (error?.code !== "ER_BAD_FIELD_ERROR") throw error;
+          await conn.execute(
+            "INSERT INTO order_items (order_id, menu_item_id, quantity, unit_price) VALUES (?, ?, ?, ?)",
+            [orderId, line.menuItemId, line.quantity, line.unitPrice]
+          );
+        }
       }
 
       await conn.commit();
@@ -568,7 +588,10 @@ function orderRouter(io) {
       return res.status(201).json({ orderId, tokenNumber, created: true });
     } catch (error) {
       await conn.rollback();
-      return res.status(500).json({ message: "Failed to place takeaway order", details: error.message });
+      return res.status(500).json({
+        message: "Failed to place takeaway order",
+        details: error.message,
+      });
     } finally {
       conn.release();
     }

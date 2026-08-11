@@ -1,4 +1,5 @@
 const { getDefaultMenuForVendorType } = require("../config/defaultMenusByVendorType");
+const { getVendorTypeConfig } = require("../config/vendorTypes");
 
 /**
  * Seed starter categories + items for a restaurant from its vendor type.
@@ -31,6 +32,7 @@ async function seedDefaultMenuForRestaurant(pool, {
     "restaurant";
 
   const template = getDefaultMenuForVendorType(type);
+  const typeConfig = getVendorTypeConfig(type);
   if (!template?.categories?.length) {
     return { seeded: false, reason: "no_template", categoriesCreated: 0, itemsCreated: 0, businessType: type };
   }
@@ -91,7 +93,11 @@ async function seedDefaultMenuForRestaurant(pool, {
       const price = Number(item.price) > 0 ? Number(item.price) : 1;
       const isVeg = item.isVeg !== false ? 1 : 0;
       const text = item.description ? String(item.description).trim() : "";
-      const storedDescription = text ? JSON.stringify({ text, imageUrl: null }) : null;
+      const sellUnit = String(item.unit || typeConfig.defaultUnit || "").trim() || null;
+      const storedDescription =
+        text || sellUnit
+          ? JSON.stringify({ text: text || null, imageUrl: null, unit: sellUnit })
+          : null;
 
       const [itemResult] = await db.execute(
         "INSERT INTO menu_items (tenant_id, restaurant_id, category_id, name, description, price, is_veg, is_available, available_stock) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0)",

@@ -1159,6 +1159,7 @@ router.post("/menu/items", auth(), tenantScope, rbac("OWNER", "MANAGER"), upload
     name: z.string().min(2),
     description: z.string().optional(),
     imageUrl: z.string().max(1000).optional(),
+    unit: z.string().max(40).optional(),
     price: z.coerce.number().positive(),
     isVeg: z
       .union([z.boolean(), z.string()])
@@ -1173,8 +1174,10 @@ router.post("/menu/items", auth(), tenantScope, rbac("OWNER", "MANAGER"), upload
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ errors: parsed.error.issues });
 
-  const { categoryId, restaurantId, name, description, imageUrl, price, isVeg, isAvailable, availableStock } = parsed.data;
+  const { categoryId, restaurantId, name, description, imageUrl, unit, price, isVeg, isAvailable, availableStock } =
+    parsed.data;
   const textDescription = (description || "").trim();
+  const sellUnit = String(unit || "").trim() || null;
   const uploadedImageUrl = req.file ? `/uploads/${req.file.filename}` : "";
   const itemImageUrl = uploadedImageUrl || (imageUrl || "").trim();
   if (itemImageUrl && !uploadFileExists(itemImageUrl)) {
@@ -1183,8 +1186,8 @@ router.post("/menu/items", auth(), tenantScope, rbac("OWNER", "MANAGER"), upload
     });
   }
   const storedDescription =
-    textDescription || itemImageUrl
-      ? JSON.stringify({ text: textDescription || null, imageUrl: itemImageUrl || null })
+    textDescription || itemImageUrl || sellUnit
+      ? JSON.stringify({ text: textDescription || null, imageUrl: itemImageUrl || null, unit: sellUnit })
       : null;
 
   const hasIsAvailable = await ensureMenuItemsIsAvailableColumn();
@@ -1201,6 +1204,7 @@ router.post("/menu/items", auth(), tenantScope, rbac("OWNER", "MANAGER"), upload
     id: result.insertId,
     message: "Menu item created",
     imageUrl: itemImageUrl || null,
+    unit: sellUnit,
   });
 });
 
@@ -1258,6 +1262,7 @@ router.post(
       const stored = JSON.stringify({
         text: meta.text || null,
         imageUrl: resolved || meta.imageUrl,
+        unit: meta.unit || null,
         imageSyncedAt: syncedAt,
       });
       const [result] = await pool.execute(
@@ -1291,6 +1296,7 @@ router.patch("/menu/items/:itemId", auth(), tenantScope, rbac("OWNER", "MANAGER"
     name: z.string().min(2),
     description: z.string().optional(),
     imageUrl: z.string().max(1000).optional(),
+    unit: z.string().max(40).optional(),
     price: z.coerce.number().positive(),
     isVeg: z
       .union([z.boolean(), z.string()])
@@ -1308,26 +1314,31 @@ router.patch("/menu/items/:itemId", auth(), tenantScope, rbac("OWNER", "MANAGER"
   const itemId = Number(req.params.itemId);
   if (!itemId) return res.status(400).json({ message: "Valid itemId is required" });
 
-  const { categoryId, restaurantId, name, description, imageUrl, price, isVeg, isAvailable, availableStock } = parsed.data;
+  const { categoryId, restaurantId, name, description, imageUrl, unit, price, isVeg, isAvailable, availableStock } =
+    parsed.data;
   const textDescription = (description || "").trim();
+  const sellUnit = String(unit || "").trim() || null;
   const uploadedImageUrl = req.file ? `/uploads/${req.file.filename}` : "";
   let itemImageUrl = uploadedImageUrl || (imageUrl || "").trim();
-  if (!itemImageUrl) {
+  let prevUnit = null;
+  {
     const [[existing]] = await pool.execute(
       "SELECT description FROM menu_items WHERE id = ? AND tenant_id = ? LIMIT 1",
       [itemId, req.tenantId]
     );
     const prev = parseMenuItemDescription(existing?.description);
-    itemImageUrl = prev.imageUrl || "";
+    if (!itemImageUrl) itemImageUrl = prev.imageUrl || "";
+    prevUnit = prev.unit || null;
   }
   if (itemImageUrl && !uploadFileExists(itemImageUrl)) {
     return res.status(400).json({
       message: "Image file not found on server. Upload the image file again (do not paste an old path).",
     });
   }
+  const finalUnit = sellUnit || prevUnit;
   const storedDescription =
-    textDescription || itemImageUrl
-      ? JSON.stringify({ text: textDescription || null, imageUrl: itemImageUrl || null })
+    textDescription || itemImageUrl || finalUnit
+      ? JSON.stringify({ text: textDescription || null, imageUrl: itemImageUrl || null, unit: finalUnit })
       : null;
 
   const hasIsAvailable = await ensureMenuItemsIsAvailableColumn();

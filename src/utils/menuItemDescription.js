@@ -3,19 +3,29 @@ const { resolveMenuItemUploadPath, normalizeStoredUploadPath } = require("./menu
 /** Parse menu_items.description JSON (owner text + image path). */
 
 function parseMenuItemDescription(description) {
-  if (!description) return { text: "", imageUrl: null };
+  if (!description) return { text: "", imageUrl: null, unit: null };
   try {
     const data = JSON.parse(description);
     if (data && typeof data === "object") {
       const imageUrl = String(data.imageUrl || data.image || "").trim() || null;
-      const text = String(data.text || data.notes || data.ingredients || "").trim();
-      return { text, imageUrl };
+      let text = String(data.text || data.notes || data.ingredients || "").trim();
+      let unit = String(data.unit || data.sellUnit || "").trim() || null;
+      // Legacy seeded notes like "Per kg" → treat as unit when unit missing
+      if (!unit && /^per\s+/i.test(text)) {
+        const inferred = text.replace(/^per\s+/i, "").trim().toLowerCase();
+        const map = { kg: "kg", grams: "g", g: "g", piece: "piece", litre: "litre", bunch: "bunch", dozen: "dozen", set: "piece" };
+        if (map[inferred]) {
+          unit = map[inferred];
+          text = "";
+        }
+      }
+      return { text, imageUrl, unit };
     }
   } catch {
     /* plain text */
   }
   const plain = String(description).trim();
-  return { text: plain, imageUrl: null };
+  return { text: plain, imageUrl: null, unit: null };
 }
 
 function menuItemDisplayRating(itemId, restaurantRating) {
@@ -74,6 +84,7 @@ function enrichBrowseMenuItem(row, { mostOrderedIds, restaurantRating, statsByIt
     image_url: imageUrl,
     image_available,
     description_text: meta.text || null,
+    sell_unit: meta.unit || null,
     rating: menuItemDisplayRating(id, restaurantRating),
     order_times: stat?.orderTimes ?? 0,
     total_qty: stat?.totalQty ?? 0,

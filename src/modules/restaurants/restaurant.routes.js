@@ -25,6 +25,7 @@ const {
 } = require("../../utils/geo");
 const { parseStructuredAddressFromBody } = require("../../utils/structuredAddress");
 const { VENDOR_TYPE_KEYS, getVendorTypeLabel, getVendorTypeConfig } = require("../../config/vendorTypes");
+const { ensureVendorTenant } = require("../../utils/restaurantTenant");
 
 function resolveRestaurantAddressFromRequest(body) {
   const structured = parseStructuredAddressFromBody(body);
@@ -290,6 +291,15 @@ router.post(
   const address = addrResolved.formattedAddress;
   const lat = addrResolved.latitude ?? parseCoord(parsed.data.latitude);
   const lng = addrResolved.longitude ?? parseCoord(parsed.data.longitude);
+
+  let tenantId = req.user.tenantId ? Number(req.user.tenantId) : null;
+  if (!tenantId) {
+    tenantId = await ensureVendorTenant(pool, {
+      ownerUserId: req.user.sub,
+      businessName: name,
+    });
+  }
+
   let result;
   try {
     [result] = await pool.execute(
@@ -298,7 +308,7 @@ router.post(
        latitude, longitude, owner_user_id, kyc_document_url, approval_status, business_type, business_type_label, vendor_config)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)`,
       [
-        req.user.tenantId ? Number(req.user.tenantId) : null,
+        tenantId,
         name,
         slug,
         description || null,
@@ -324,7 +334,7 @@ router.post(
     [result] = await pool.execute(
       "INSERT INTO restaurants (tenant_id, name, slug, description, address, owner_user_id, kyc_document_url, approval_status) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')",
       [
-        req.user.tenantId ? Number(req.user.tenantId) : null,
+        tenantId,
         name,
         slug,
         description || null,
@@ -588,7 +598,7 @@ router.get("/my", auth(), rbac("OWNER"), async (req, res) => {
   let rows;
   try {
     [rows] = await pool.execute(
-      `SELECT id, name, slug, description, rating, approval_status, kyc_document_url, is_online,
+      `SELECT id, name, slug, description, rating, approval_status, kyc_document_url, is_online, tenant_id,
               address, address_village, address_city, address_district, address_state, address_country, address_pincode,
               latitude, longitude,
               COALESCE(business_type, 'restaurant') AS business_type, business_type_label, vendor_config
@@ -598,11 +608,28 @@ router.get("/my", auth(), rbac("OWNER"), async (req, res) => {
   } catch (error) {
     if (error?.code !== "ER_BAD_FIELD_ERROR") throw error;
     [rows] = await pool.execute(
-      `SELECT id, name, slug, description, rating, approval_status, kyc_document_url, is_online, address
+      `SELECT id, name, slug, description, rating, approval_status, kyc_document_url, is_online, tenant_id, address
        FROM restaurants WHERE owner_user_id = ? ORDER BY id DESC`,
       [req.user.sub]
     );
   }
+
+  // Auto-heal shops registered without a tenant so Products/Orders APIs work
+  for (const row of rows || []) {
+    if (row.tenant_id == null || row.tenant_id === "" || Number(row.tenant_id) === 0) {
+      try {
+        const tenantId = await ensureVendorTenant(pool, {
+          restaurantId: row.id,
+          ownerUserId: req.user.sub,
+          businessName: row.name,
+        });
+        row.tenant_id = tenantId;
+      } catch {
+        // leave null; client will still show error until heal succeeds
+      }
+    }
+  }
+
   return res.json(rows.map(enrichRestaurantAddressFields));
 });
 
@@ -929,6 +956,23 @@ router.get("/managed", auth(), rbac("OWNER", "MANAGER"), async (req, res) => {
       vendor_config: vendorConfig,
     };
   });
+
+  if (req.user.role === "OWNER") {
+    for (const item of items) {
+      if (item.tenant_id == null || item.tenant_id === 0) {
+        try {
+          item.tenant_id = await ensureVendorTenant(pool, {
+            restaurantId: item.id,
+            ownerUserId: req.user.sub,
+            businessName: item.name,
+          });
+        } catch {
+          // ignore heal failure
+        }
+      }
+    }
+  }
+
   return res.json(items);
 });
 

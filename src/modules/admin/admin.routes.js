@@ -9,6 +9,7 @@ const rbac = require("../../middlewares/rbac");
 const { platformApprover } = require("../../middlewares/platformApprover");
 const { VENDOR_TYPES, VENDOR_TYPE_KEYS, getVendorTypeLabel, getVendorTypeConfig } = require("../../config/vendorTypes");
 const { normalizeIndianPhone } = require("../../utils/phone");
+const { ensureVendorTenant } = require("../../utils/restaurantTenant");
 
 const router = express.Router();
 
@@ -391,16 +392,33 @@ router.post("/super/restaurants", auth(), rbac("ADMIN", "SUPER_ADMIN"), async (r
   const defaultConfig = getVendorTypeConfig(businessType);
   const finalConfig = vendorConfig ? { ...defaultConfig, ...vendorConfig } : defaultConfig;
   try {
+    // Always ensure shop + owner share a tenant (auto-create when blank)
+    const resolvedTenantId =
+      tenantId != null
+        ? Number(tenantId)
+        : await ensureVendorTenant(pool, { ownerUserId, businessName: name });
+
+    if (ownerUserId && resolvedTenantId) {
+      await pool.execute(
+        "UPDATE users SET tenant_id = ? WHERE id = ? AND (tenant_id IS NULL OR tenant_id = 0)",
+        [resolvedTenantId, ownerUserId]
+      );
+    }
+
     const [result] = await pool.execute(
       "INSERT INTO restaurants (tenant_id, owner_user_id, name, slug, description, address, kyc_document_url, approval_status, business_type, business_type_label, vendor_config) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      [tenantId, ownerUserId, name, makeSlug(name), description, address, "{}", approvalStatus, businessType, businessTypeLabel, JSON.stringify(finalConfig)]
+      [resolvedTenantId, ownerUserId, name, makeSlug(name), description, address, "{}", approvalStatus, businessType, businessTypeLabel, JSON.stringify(finalConfig)]
     ).catch(async () => {
       return pool.execute(
         "INSERT INTO restaurants (tenant_id, owner_user_id, name, slug, description, address, kyc_document_url, approval_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        [tenantId, ownerUserId, name, makeSlug(name), description, address, "{}", approvalStatus]
+        [resolvedTenantId, ownerUserId, name, makeSlug(name), description, address, "{}", approvalStatus]
       );
     });
-    return res.status(201).json({ id: Number(result.insertId), message: "Vendor registered successfully" });
+    return res.status(201).json({
+      id: Number(result.insertId),
+      tenantId: resolvedTenantId,
+      message: "Vendor registered successfully",
+    });
   } catch (error) {
     return res.status(500).json({ message: "Failed to register vendor.", details: error.message });
   }

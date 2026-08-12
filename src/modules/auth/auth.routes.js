@@ -497,11 +497,21 @@ async function findUserForLogin(identifierRaw) {
 
   if (raw.includes("@")) {
     const email = normalizeEmail(raw);
-    const [rows] = await pool.execute(
-      "SELECT id, full_name, email, password_hash, role, tenant_id FROM users WHERE email = ? AND is_active = 1 LIMIT 1",
-      [email]
-    );
-    return rows[0] || null;
+    try {
+      const [rows] = await pool.execute(
+        "SELECT id, full_name, email, phone, password_hash, role, tenant_id FROM users WHERE email = ? AND is_active = 1 LIMIT 1",
+        [email]
+      );
+      if (rows[0]) return rows[0];
+    } catch (err) {
+      if (err?.code !== "ER_BAD_FIELD_ERROR") throw err;
+      const [rows] = await pool.execute(
+        "SELECT id, full_name, email, password_hash, role, tenant_id FROM users WHERE email = ? AND is_active = 1 LIMIT 1",
+        [email]
+      );
+      return rows[0] || null;
+    }
+    return null;
   }
 
   const phoneParsed = validateIndianPhone(raw);
@@ -510,7 +520,7 @@ async function findUserForLogin(identifierRaw) {
 
   try {
     const [rows] = await pool.execute(
-      "SELECT id, full_name, email, password_hash, role, tenant_id FROM users WHERE phone = ? AND is_active = 1 LIMIT 1",
+      "SELECT id, full_name, email, phone, password_hash, role, tenant_id FROM users WHERE phone = ? AND is_active = 1 LIMIT 1",
       [phone]
     );
     if (rows[0]) return rows[0];
@@ -520,7 +530,7 @@ async function findUserForLogin(identifierRaw) {
 
   try {
     const [rows] = await pool.execute(
-      `SELECT u.id, u.full_name, u.email, u.password_hash, u.role, u.tenant_id
+      `SELECT u.id, u.full_name, u.email, u.phone, u.password_hash, u.role, u.tenant_id
        FROM users u
        INNER JOIN subscription_subscribers s ON s.user_id = u.id
        WHERE s.phone = ? AND u.is_active = 1
@@ -626,6 +636,7 @@ router.post("/login", async (req, res) => {
         id: Number(user.id),
         fullName: user.full_name,
         email: user.email,
+        phone: user.phone || null,
         role: user.role,
         tenantId: user.tenant_id ? Number(user.tenant_id) : null,
       },

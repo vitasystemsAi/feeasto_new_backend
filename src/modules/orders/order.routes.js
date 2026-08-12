@@ -17,6 +17,7 @@ const {
   canCustomerCancelOrder,
   customerCancelDeadlineIso,
   normalizeTimeoutCancellationReason,
+  isTimeUpCancellation,
 } = require("../../utils/orderStatus");
 const {
   OWNER_ACCEPT_DEADLINE_MINUTES,
@@ -1663,6 +1664,7 @@ function orderRouter(io) {
 
     const [[order]] = await pool.execute(
       `SELECT o.id, o.status, o.order_type, o.customer_user_id, o.tenant_id, o.restaurant_id, o.accepted_at,
+              o.cancelled_by, o.cancellation_reason,
               d.status AS delivery_status, r.owner_user_id,
               p.id AS delivery_partner_profile_id
        FROM orders o
@@ -1717,11 +1719,26 @@ function orderRouter(io) {
       return res.json({ message: "Order already in this status", ...payload });
     }
 
+    if (
+      requestedStatus === "ACCEPTED" &&
+      (currentStatus === "CANCELLED" || currentStatus === "REJECTED")
+    ) {
+      const timedOut = isTimeUpCancellation(order.cancellation_reason, order.cancelled_by);
+      return res.status(400).json({
+        code: "ORDER_NOT_ACCEPTABLE",
+        status: currentStatus,
+        message: timedOut
+          ? "This order was automatically cancelled because it was not accepted in time."
+          : `This order is already ${currentStatus.toLowerCase()} and cannot be accepted.`,
+      });
+    }
+
     const allowed = getOwnerNextActions(order.status, order.order_type, { hasDeliveryPartner }).map(
       (a) => a.status
     );
     if (!allowed.includes(requestedStatus)) {
       return res.status(400).json({
+        code: "INVALID_STATUS_TRANSITION",
         message: `Cannot move order from ${order.status} to ${parsed.data.status}.`,
       });
     }

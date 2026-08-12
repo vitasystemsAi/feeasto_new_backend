@@ -280,6 +280,34 @@ async function buildOwnerOrderAlertPayload(orderId, tenantId, restaurantId) {
   };
 }
 
+/** Notify vendor dashboards even if the owner never joined the tenant socket room. */
+function emitOwnerOrderAlert(io, ownerAlert, ownerUserId) {
+  if (!io || !ownerAlert?.requiresOwnerAction) return;
+  const tenantId = ownerAlert.tenantId;
+  if (tenantId) {
+    io.to(`tenant:${tenantId}`).emit("order:owner-alert", ownerAlert);
+    io.to(`tenant:${tenantId}`).emit("order:created", {
+      ...ownerAlert,
+      requiresOwnerAction: true,
+    });
+  }
+  if (ownerUserId) {
+    io.to(`user:${ownerUserId}`).emit("order:owner-alert", ownerAlert);
+    io.to(`user:${ownerUserId}`).emit("order:created", {
+      ...ownerAlert,
+      requiresOwnerAction: true,
+    });
+  }
+}
+
+async function resolveRestaurantOwnerUserId(restaurantId) {
+  const [[row]] = await pool.execute(
+    "SELECT owner_user_id FROM restaurants WHERE id = ? LIMIT 1",
+    [restaurantId]
+  );
+  return row?.owner_user_id ? Number(row.owner_user_id) : null;
+}
+
 async function ensureAcceptedAtColumn() {
   if (hasAcceptedAtColumnCache === true) return true;
   const [rows] = await pool.execute(
@@ -578,12 +606,19 @@ function orderRouter(io) {
       }
 
       await conn.commit();
-      io.to(`tenant:${req.tenantId}`).emit("order:created", {
-        orderId,
-        status: "PLACED",
-        orderType: "TAKEAWAY",
-        tokenNumber,
-      });
+      const ownerAlert = await buildOwnerOrderAlertPayload(orderId, req.tenantId, parsed.data.restaurantId);
+      const ownerUserId = await resolveRestaurantOwnerUserId(parsed.data.restaurantId);
+      if (ownerAlert?.requiresOwnerAction) {
+        emitOwnerOrderAlert(io, ownerAlert, ownerUserId);
+      } else {
+        io.to(`tenant:${req.tenantId}`).emit("order:created", {
+          orderId,
+          status: "PLACED",
+          orderType: "TAKEAWAY",
+          restaurantId: parsed.data.restaurantId,
+          tokenNumber,
+        });
+      }
       // Do not also emit order:items-added — that double-fires prep prints / looks like a bill run.
       return res.status(201).json({ orderId, tokenNumber, created: true });
     } catch (error) {
@@ -1307,14 +1342,14 @@ function orderRouter(io) {
     let restaurant;
     try {
       [[restaurant]] = await pool.execute(
-        `SELECT id, tenant_id, name, is_online, latitude, longitude
+        `SELECT id, tenant_id, owner_user_id, name, is_online, latitude, longitude
          FROM restaurants WHERE id = ? AND approval_status = 'APPROVED' AND is_active = 1 LIMIT 1`,
         [restaurantId]
       );
     } catch (error) {
       if (error?.code !== "ER_BAD_FIELD_ERROR") throw error;
       [[restaurant]] = await pool.execute(
-        `SELECT id, tenant_id, name, is_online
+        `SELECT id, tenant_id, owner_user_id, name, is_online
          FROM restaurants WHERE id = ? AND approval_status = 'APPROVED' AND is_active = 1 LIMIT 1`,
         [restaurantId]
       );
@@ -1505,16 +1540,20 @@ function orderRouter(io) {
       const itemsByOrder = await fetchOrderItems([orderId]);
       const placedItems = itemsByOrder[orderId] || [];
       const ownerAlert = await buildOwnerOrderAlertPayload(orderId, tenantId, restaurantId);
-      if (ownerAlert?.requiresOwnerAction) {
-        io.to(`tenant:${tenantId}`).emit("order:owner-alert", ownerAlert);
+      const ownerUserId =
+        restaurant.owner_user_id != null
+          ? Number(restaurant.owner_user_id)
+          : await resolveRestaurantOwnerUserId(restaurantId);
+      emitOwnerOrderAlert(io, ownerAlert, ownerUserId);
+      if (!ownerAlert?.requiresOwnerAction) {
+        io.to(`tenant:${tenantId}`).emit("order:created", {
+          orderId,
+          status: "PLACED",
+          restaurantId,
+          orderType,
+          requiresOwnerAction: false,
+        });
       }
-      io.to(`tenant:${tenantId}`).emit("order:created", {
-        orderId,
-        status: "PLACED",
-        restaurantId,
-        orderType,
-        requiresOwnerAction: Boolean(ownerAlert?.requiresOwnerAction),
-      });
       io.to(`tenant:${tenantId}`).emit("order:items-added", { orderId, restaurantId, orderType });
       io.to(`user:${req.user.sub}`).emit("order:created", { orderId, status: "PLACED", restaurantId, orderType });
       return res.status(201).json({

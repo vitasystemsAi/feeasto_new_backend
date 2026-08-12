@@ -1,7 +1,7 @@
 const pool = require("../db/pool");
 const { buildStatusPayload } = require("../utils/orderStatus");
 
-const OWNER_ACCEPT_DEADLINE_MINUTES = 6;
+const OWNER_ACCEPT_DEADLINE_MINUTES = 12;
 /** Shown to customer when the restaurant does not accept within the deadline. */
 const AUTO_CANCEL_REASON =
   "The restaurant did not accept your order within time. Your order was automatically cancelled.";
@@ -61,6 +61,20 @@ async function autoCancelPlacedOrder(orderRow, io) {
   io.to(`tenant:${tenantId}`).emit("order:status-updated", payload);
   if (customerUserId) {
     io.to(`user:${customerUserId}`).emit("order:status-updated", payload);
+  }
+  try {
+    const restaurantId = Number(orderRow.restaurant_id);
+    if (restaurantId) {
+      const [[rest]] = await pool.execute(
+        "SELECT owner_user_id FROM restaurants WHERE id = ? LIMIT 1",
+        [restaurantId]
+      );
+      if (rest?.owner_user_id) {
+        io.to(`user:${rest.owner_user_id}`).emit("order:status-updated", payload);
+      }
+    }
+  } catch {
+    /* optional owner notify */
   }
 
   return true;

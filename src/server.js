@@ -3,7 +3,8 @@ const bcrypt = require("bcryptjs");
 const { Server } = require("socket.io");
 const createApp = require("./app");
 const env = require("./config/env");
-const pool = require("./db/pool");
+const pool = require("./db/pool");                          // legacy shim → super_admin_saas
+const { getSuperAdminPool, getCustomerPool } = require("./db/dbManager");
 const { ensurePortalSchema } = require("./modules/portal/ensurePortalSchema");
 const { ensureLocationColumns } = require("./utils/ensureLocationColumns");
 const { ensureStructuredAddressSchema } = require("./utils/ensureStructuredAddressSchema");
@@ -125,8 +126,65 @@ async function ensureRegistrationOtpSchema() {
   }
 }
 
+async function ensureSuperAdminPlatformUser() {
+  /**
+   * Bootstrap the SUPER_ADMIN account in super_admin_saas.platform_users.
+   * The old code used restaurant_saas.users for this; we now use the
+   * dedicated platform DB. Both are kept in sync during migration.
+   */
+  const saPool    = getSuperAdminPool();
+  const adminEmail = String(env.defaultAdminEmail || "").trim().toLowerCase();
+  if (!adminEmail) return;
+
+  const hash = await bcrypt.hash(env.defaultAdminPassword, 10);
+
+  // Ensure platform_users table exists (schema applied via super_admin_saas.sql)
+  await saPool.query(`
+    CREATE TABLE IF NOT EXISTS platform_users (
+      id            BIGINT PRIMARY KEY AUTO_INCREMENT,
+      full_name     VARCHAR(120)  NOT NULL,
+      email         VARCHAR(150)  UNIQUE NOT NULL,
+      phone         VARCHAR(20)   NULL,
+      password_hash VARCHAR(255)  NOT NULL,
+      role          ENUM('SUPER_ADMIN','ADMIN') NOT NULL DEFAULT 'ADMIN',
+      is_active     TINYINT(1)    NOT NULL DEFAULT 1,
+      last_login_at TIMESTAMP     NULL,
+      created_at    TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at    TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )
+  `);
+
+  const [[existing]] = await saPool.execute(
+    "SELECT id, role FROM platform_users WHERE email = ? LIMIT 1",
+    [adminEmail]
+  );
+  if (!existing) {
+    await saPool.execute(
+      "INSERT INTO platform_users (full_name, email, password_hash, role, is_active) VALUES (?, ?, ?, 'SUPER_ADMIN', 1)",
+      [env.defaultAdminName, adminEmail, hash]
+    );
+    console.log(`[super_admin_saas] Platform super-admin created: ${adminEmail}`);
+  } else if (existing.role !== "SUPER_ADMIN") {
+    await saPool.execute(
+      "UPDATE platform_users SET role = 'SUPER_ADMIN', password_hash = ?, is_active = 1 WHERE id = ?",
+      [hash, existing.id]
+    );
+    console.log(`[super_admin_saas] Platform super-admin promoted: ${adminEmail}`);
+  }
+}
+
 async function startServer() {
   try {
+    // ── Ping all three core databases ──────────────────────────────────────
+    console.log("[db] Connecting to super_admin_saas ...");
+    await getSuperAdminPool().query("SELECT 1");
+    console.log("[db] super_admin_saas  ✓");
+
+    console.log("[db] Connecting to customer_saas ...");
+    await getCustomerPool().query("SELECT 1");
+    console.log("[db] customer_saas     ✓");
+
+    // Legacy pool (also super_admin_saas via shim) — kept for backward compat
     await pool.query("SELECT 1");
     await ensureInventorySchema();
     await ensureTableWiseOrderSchema();
@@ -149,6 +207,10 @@ async function startServer() {
     }
     startTrendingSyncJob();
     startOwnerAcceptTimeoutJob(io);
+    // Bootstrap SUPER_ADMIN in super_admin_saas.platform_users
+    await ensureSuperAdminPlatformUser();
+
+    // Also keep old restaurant_saas.users SUPER_ADMIN during transition
     const adminEmail = String(env.defaultAdminEmail || "").trim().toLowerCase();
     if (adminEmail) {
       const [[existing]] = await pool.execute("SELECT id, role FROM users WHERE email = ? LIMIT 1", [adminEmail]);
@@ -159,14 +221,14 @@ async function startServer() {
           [env.defaultAdminName, adminEmail, hash]
         );
         // eslint-disable-next-line no-console
-        console.log(`Default super admin created: ${adminEmail}`);
+        console.log(`Default super admin created (legacy restaurant_saas): ${adminEmail}`);
       } else if (existing.role !== "SUPER_ADMIN") {
         await pool.execute(
           "UPDATE users SET role = 'SUPER_ADMIN', password_hash = ?, is_active = 1 WHERE id = ?",
           [hash, existing.id]
         );
         // eslint-disable-next-line no-console
-        console.log(`Default super admin promoted: ${adminEmail}`);
+        console.log(`Default super admin promoted (legacy): ${adminEmail}`);
       }
     }
     server.listen(env.port, () => {

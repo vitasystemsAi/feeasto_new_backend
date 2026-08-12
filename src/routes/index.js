@@ -7,6 +7,7 @@ const complaintRoutes = require("../modules/complaints/complaint.routes");
 const analyticsRoutes = require("../modules/analytics/analytics.routes");
 const aiRoutes = require("../modules/ai/ai.routes");
 const adminRoutes = require("../modules/admin/admin.routes");
+const vendorApprovalRoutes = require("../modules/admin/vendorApproval");
 const tableRoutes = require("../modules/tables/table.routes");
 const tablePublicRoutes = require("../modules/tables/table-public.routes");
 const tableCustomersRoutes = require("../modules/tables/table-customers.routes");
@@ -35,6 +36,8 @@ function createRouter(io) {
   router.use("/analytics", analyticsRoutes);
   router.use("/ai", aiRoutes);
   router.use("/admin", adminRoutes);
+  // New multi-DB vendor approval routes (super_admin_saas)
+  router.use("/admin", vendorApprovalRoutes);
   router.use("/tables", tableRoutes(io));
   router.use("/public/table-qr", tablePublicRoutes(io));
   router.use("/table-customers", tableCustomersRoutes());
